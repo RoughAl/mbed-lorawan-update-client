@@ -21,11 +21,13 @@
 #include "mbed.h"
 #include "mbed_delta_update.h"
 #include "mbed_stats.h"
-#include "update_types.h"
 #include "BDFile.h"
 #include "FragmentationSha256.h"
 #include "FragmentationEcdsaVerify.h"
 #include "FragmentationBlockDeviceWrapper.h"
+#include "arm_uc_metadata_header_v2.h"
+#include "update_params.h"
+#include "update_types.h"
 
 #ifndef NB_FRAG_GROUPS
 #define NB_FRAG_GROUPS          1

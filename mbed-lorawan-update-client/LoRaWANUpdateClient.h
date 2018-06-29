@@ -19,8 +19,10 @@
 #define _LORAWAN_UPDATE_CLIENT_H_
 
 #include "mbed.h"
+#include "mbed_delta_update.h"
 #include "mbed_stats.h"
 #include "update_types.h"
+#include "BDFile.h"
 #include "FragmentationSha256.h"
 #include "FragmentationEcdsaVerify.h"
 #include "FragmentationBlockDeviceWrapper.h"
@@ -31,6 +33,10 @@
 
 #ifndef LW_UC_SHA256_BUFFER_SIZE
 #define LW_UC_SHA256_BUFFER_SIZE       128
+#endif
+
+#ifndef LW_UC_JANPATCH_BUFFER_SIZE
+#define LW_UC_JANPATCH_BUFFER_SIZE     528
 #endif
 
 enum LW_UC_STATUS {
@@ -45,7 +51,11 @@ enum LW_UC_STATUS {
     LW_UC_SIGNATURE_DEVICECLASS_UUID_MISMATCH = 8,
     LW_UC_SIGNATURE_ECDSA_FAILED = 9,
     LW_UC_OUT_OF_MEMORY = 10,
-    LW_UC_CREATE_BOOTLOADER_HEADER_FAILED = 11
+    LW_UC_CREATE_BOOTLOADER_HEADER_FAILED = 11,
+    LW_UC_INVALID_SLOT = 12,
+    LW_UC_DIFF_SIZE_MISMATCH = 13,
+    LW_UC_DIFF_INCORRECT_SLOT2_HASH = 14,
+    LW_UC_DIFF_DELTA_UPDATE_FAILED = 15
 };
 
 enum LW_UC_EVENT {
@@ -208,21 +218,70 @@ private:
                 delete frag_sessions[fragIx].session;
             }
 
-            LW_UC_STATUS authStatus = verifyAuthenticity(fragIx);
-
-            // set back to inactive
+            // make the session inactive
             frag_sessions[fragIx].active = false;
 
-            if (authStatus != LW_UC_OK) {
-                return authStatus;
+            // Options contain info on where the manifest is placed
+            FragmentationSessionOpts_t opts = frag_sessions[fragIx].sessionOptions;
+
+            // the signature is the last FOTA_SIGNATURE_LENGTH bytes of the package
+            size_t signatureOffset = opts.FlashOffset + ((opts.NumberOfFragments * opts.FragmentSize) - opts.Padding) - FOTA_SIGNATURE_LENGTH;
+
+            // Manifest to read in
+            UpdateSignature_t header;
+            if (_bd.read(&header, signatureOffset, FOTA_SIGNATURE_LENGTH) != BD_ERROR_OK) {
+                return LW_UC_BD_READ_ERROR;
             }
-            else {
+
+            // So... now it depends on whether this is a delta update or not...
+            uint8_t* diff_info = (uint8_t*)&(header.diff_info);
+
+            printf("Diff? %d, size=%d\n", diff_info[0], (diff_info[1] << 16) + (diff_info[2] << 8) + diff_info[3]);
+
+            if (diff_info[0] == 0) { // Not a diff...
+                // last FOTA_SIGNATURE_LENGTH bytes should be ignored because the signature is not part of the firmware
+                size_t fwSize = (opts.NumberOfFragments * opts.FragmentSize) - opts.Padding - FOTA_SIGNATURE_LENGTH;
+                LW_UC_STATUS authStatus = verifyAuthenticityAndWriteBootloader(
+                    MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT0_HEADER_ADDRESS,
+                    &header,
+                    opts.FlashOffset,
+                    fwSize);
+
+                if (authStatus != LW_UC_OK) return authStatus;
+
                 if (_event_cb) {
                     _event_cb(LW_UC_EVENT_FIRMWARE_READY);
                 }
 
                 return LW_UC_OK;
             }
+            else {
+                uint32_t slot1Size;
+                LW_UC_STATUS deltaStatus = applySlot0Slot2DeltaUpdate(
+                    (opts.NumberOfFragments * opts.FragmentSize) - opts.Padding - FOTA_SIGNATURE_LENGTH,
+                    (diff_info[1] << 16) + (diff_info[2] << 8) + diff_info[3],
+                    &slot1Size
+                );
+
+                if (deltaStatus != LW_UC_OK) return deltaStatus;
+
+                LW_UC_STATUS authStatus = verifyAuthenticityAndWriteBootloader(
+                    MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT1_HEADER_ADDRESS,
+                    &header,
+                    MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT1_FW_ADDRESS,
+                    slot1Size);
+
+                if (authStatus != LW_UC_OK) return authStatus;
+
+                if (_event_cb) {
+                    _event_cb(LW_UC_EVENT_FIRMWARE_READY);
+                }
+
+                return LW_UC_OK;
+            }
+
+
+
         }
 
         printf("process_frame failed (%d)\n", result);
@@ -230,30 +289,21 @@ private:
     }
 
     /**
-     * Verify the authenticity (SHA hash and ECDSA hash) of a firmware package
+     * Verify the authenticity (SHA hash and ECDSA hash) of a firmware package,
+     * and after passing verification write the bootloader header
      *
-     * @param fragIx Fragmentation slot index
+     * @param addr Address of firmware slot (MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT0_HEADER_ADDRESS or MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT1_HEADER_ADDRESS)
+     * @param header Firmware manifest
+     * @param flashOffset Offset in flash of the firmware
+     * @param flashLength Length in flash of the firmware
      */
-    LW_UC_STATUS verifyAuthenticity(uint8_t fragIx) {
-        if (!frag_sessions[fragIx].active) return LW_UC_FRAG_SESSION_NOT_ACTIVE;
+    LW_UC_STATUS verifyAuthenticityAndWriteBootloader(uint32_t addr, UpdateSignature_t *header, size_t flashOffset, size_t flashLength) {
 
-        // Options contain info on where the manifest is placed
-        FragmentationSessionOpts_t opts = frag_sessions[fragIx].sessionOptions;
-
-        // the signature is the last FOTA_SIGNATURE_LENGTH bytes of the package
-        size_t signatureOffset = opts.FlashOffset + ((opts.NumberOfFragments * opts.FragmentSize) - opts.Padding) - FOTA_SIGNATURE_LENGTH;
-
-        // Manifest to read in
-        UpdateSignature_t header;
-        if (_bd.read(&header, signatureOffset, FOTA_SIGNATURE_LENGTH) != BD_ERROR_OK) {
-            return LW_UC_BD_READ_ERROR;
-        }
-
-        if (!compare_buffers(header.manufacturer_uuid, UPDATE_CERT_MANUFACTURER_UUID, 16)) {
+        if (!compare_buffers(header->manufacturer_uuid, UPDATE_CERT_MANUFACTURER_UUID, 16)) {
             return LW_UC_SIGNATURE_MANUFACTURER_UUID_MISMATCH;
         }
 
-        if (!compare_buffers(header.device_class_uuid, UPDATE_CERT_DEVICE_CLASS_UUID, 16)) {
+        if (!compare_buffers(header->device_class_uuid, UPDATE_CERT_DEVICE_CLASS_UUID, 16)) {
             return LW_UC_SIGNATURE_DEVICECLASS_UUID_MISMATCH;
         }
 
@@ -265,11 +315,7 @@ private:
         // SHA256 requires a large buffer, alloc on heap instead of stack
         FragmentationSha256* sha256 = new FragmentationSha256(&_bd, sha_buffer, sizeof(sha_buffer));
 
-        // The last FOTA_SIGNATURE_LENGTH bytes are reserved for the sig, so don't use it for calculating the SHA256 hash
-        sha256->calculate(
-            opts.FlashOffset,
-            (opts.NumberOfFragments * opts.FragmentSize) - opts.Padding - FOTA_SIGNATURE_LENGTH,
-            sha_out_buffer);
+        sha256->calculate(flashOffset, flashLength, sha_out_buffer);
 
         delete sha256;
 
@@ -282,15 +328,15 @@ private:
         // now check that the signature is correct...
         {
             printf("ECDSA signature is: ");
-            for (size_t ix = 0; ix < header.signature_length; ix++) {
-                printf("%02x", header.signature[ix]);
+            for (size_t ix = 0; ix < header->signature_length; ix++) {
+                printf("%02x", header->signature[ix]);
             }
             printf("\n");
             printf("Verifying signature...\n");
 
             // ECDSA requires a large buffer, alloc on heap instead of stack
             FragmentationEcdsaVerify* ecdsa = new FragmentationEcdsaVerify(UPDATE_CERT_PUBKEY, UPDATE_CERT_LENGTH);
-            bool valid = ecdsa->verify(sha_out_buffer, header.signature, header.signature_length);
+            bool valid = ecdsa->verify(sha_out_buffer, header->signature, header->signature_length);
             if (!valid) {
                 printf("Signature verification failed\n");
                 return LW_UC_SIGNATURE_ECDSA_FAILED;
@@ -302,15 +348,28 @@ private:
             delete ecdsa;
         }
 
-        return LW_UC_OK;
+        return writeBootloaderHeader(addr, flashLength, sha_out_buffer);
     }
 
-    LW_UC_STATUS writeBootloaderHeader(FragmentationSessionOpts_t opts, unsigned char sha_hash[32]) {
+    /**
+     * Write the bootloader header so the firmware can be flashed
+     *
+     * @param addr Beginning of the firmware slot (e.g. MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT0_HEADER_ADDRESS)
+     * @param fwSize Size of the firmware in bytes
+     * @param sha_hash SHA256 hash of the firmware
+     *
+     * @returns LW_UC_OK if all went well, or non-0 status when something went wrong
+     */
+    LW_UC_STATUS writeBootloaderHeader(uint32_t addr, size_t fwSize, unsigned char sha_hash[32]) {
+        if (addr != MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT0_HEADER_ADDRESS && addr != MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT1_HEADER_ADDRESS) {
+            return LW_UC_INVALID_SLOT;
+        }
+
         arm_uc_firmware_details_t details;
 
-        // @todo: replace by real version
+        // @todo: replace by real version?
         details.version = static_cast<uint64_t>(MBED_BUILD_TIMESTAMP) + 1; // should be timestamp that the fw was built, this is to get around this
-        details.size = (opts.NumberOfFragments * opts.FragmentSize) - opts.Padding - FOTA_SIGNATURE_LENGTH;
+        details.size = fwSize;
         memcpy(details.hash, sha_hash, 32); // SHA256 hash of the firmware
         memset(details.campaign, 0, ARM_UC_GUID_SIZE); // todo, add campaign info
         details.signatureSize = 0; // not sure what this is used for
@@ -330,13 +389,81 @@ private:
             return LW_UC_CREATE_BOOTLOADER_HEADER_FAILED;
         }
 
-        int r = _bd.program(buff.ptr, MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT0_HEADER_ADDRESS, buff.size);
+        int r = _bd.program(buff.ptr, addr, buff.size);
         if (r != BD_ERROR_OK) {
-            printf("Failed to program firmware header: %d bytes at address 0x%x\n", buff.size, MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT0_HEADER_ADDRESS);
+            printf("Failed to program firmware header: %d bytes at address 0x%x\n", buff.size, addr);
             return LW_UC_BD_WRITE_ERROR;
         }
 
-        printf("Stored the update parameters in flash on 0x%x. Reset the board to apply update.\n", MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT0_HEADER_ADDRESS);
+        printf("Stored the update parameters in flash on 0x%x. Reset the board to apply update.\n", addr);
+
+        return LW_UC_OK;
+    }
+
+    /**
+     * Apply a delta update between slot 2 (source file) and slot 0 (diff file) and place in slot 1
+     *
+     * @param sizeOfFwInSlot0 Size of the diff image that we just received
+     * @param sizeOfFwInSlot2 Expected size of firmware in slot 2 (will do sanity check)
+     * @param sizeOfFwInSlot1 Out parameter which will be set to the size of the new firmware in slot 1
+     */
+    LW_UC_STATUS applySlot0Slot2DeltaUpdate(size_t sizeOfFwInSlot0, size_t sizeOfFwInSlot2, uint32_t *sizeOfFwInSlot1) {
+        // read details about the current firmware, it's in the slot2 header
+        arm_uc_firmware_details_t curr_details;
+        int bd_status = _bd.read(&curr_details, MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT2_HEADER_ADDRESS, sizeof(arm_uc_firmware_details_t));
+        if (bd_status != BD_ERROR_OK) {
+            return LW_UC_BD_READ_ERROR;
+        }
+
+        // so... sanity check, do we have the same size in both places
+        if (sizeOfFwInSlot2 != curr_details.size) {
+            printf("Diff size mismatch, expecting %u but got %llu\n", sizeOfFwInSlot2, curr_details.size);
+            return LW_UC_DIFF_SIZE_MISMATCH;
+        }
+
+        // calculate sha256 hash for current fw & diff file (for debug purposes)
+        {
+            unsigned char sha_out_buffer[32];
+            uint8_t sha_buffer[LW_UC_SHA256_BUFFER_SIZE];
+            FragmentationSha256* sha256 = new FragmentationSha256(&_bd, sha_buffer, sizeof(sha_buffer));
+
+            printf("Firmware hash in slot 2 (current firmware): ");
+            sha256->calculate(MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT2_FW_ADDRESS, curr_details.size, sha_out_buffer);
+            print_buffer(sha_out_buffer, 32, false);
+            printf("\n");
+
+            printf("Firmware hash in slot 2 (expected): ");
+            print_buffer(curr_details.hash, 32, false);
+            printf("\n");
+
+            if (compare_buffers(curr_details.hash, sha_out_buffer, 32)) {
+                printf("Firmware in slot 2 hash incorrect hash\n");
+                return LW_UC_DIFF_INCORRECT_SLOT2_HASH;
+            }
+
+            printf("Firmware hash in slot 0 (diff file): ");
+            sha256->calculate(MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT0_FW_ADDRESS, sizeOfFwInSlot0, sha_out_buffer);
+            print_buffer(sha_out_buffer, 32, false);
+            printf("\n");
+
+            delete sha256;
+        }
+
+        // now run the diff...
+        BDFILE source(&_bd, MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT2_FW_ADDRESS, sizeOfFwInSlot2);
+        BDFILE diff(&_bd, MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT0_FW_ADDRESS, sizeOfFwInSlot0);
+        BDFILE target(&_bd, MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT1_FW_ADDRESS, 0);
+
+        int v = apply_delta_update(&_bd, LW_UC_JANPATCH_BUFFER_SIZE, &source, &diff, &target);
+
+        if (v != MBED_DELTA_UPDATE_OK) {
+            printf("apply_delta_update failed %d\n", v);
+            return LW_UC_DIFF_DELTA_UPDATE_FAILED;
+        }
+
+        printf("Patched firmware length is %ld\n", target.ftell());
+
+        *sizeOfFwInSlot1 = target.ftell();
 
         return LW_UC_OK;
     }
@@ -369,6 +496,21 @@ private:
             printf("%d ", prefix);
         }
         printf("Heap stats: %d / %d (max=%d)\n", heap_stats.current_size, heap_stats.reserved_size, heap_stats.max_size);
+    }
+
+    /**
+     * Print the content of a buffer
+     * @params buff Buffer
+     * @params size Size of buffer
+     * @params withSpace Whether to separate bytes by spaces
+     */
+    void print_buffer(void* buff, size_t size, bool withSpace = true) {
+        for (size_t ix = 0; ix < size; ix++) {
+            printf("%02x", ((uint8_t*)buff)[ix]);
+            if (withSpace) {
+                printf(" ");
+            }
+        }
     }
 
     // store fragmentation groups here...

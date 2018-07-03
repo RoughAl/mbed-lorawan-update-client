@@ -106,6 +106,12 @@ public:
             case DATA_FRAGMENT:
                 return handleDataFragment(buffer + 1, length - 1);
 
+            case FRAG_SESSION_DELETE_REQ:
+                return handleFragmentationDeleteReq(buffer + 1, length - 1);
+
+            case FRAG_SESSION_STATUS_REQ:
+                return handleFragmentationStatusReq(buffer + 1, length - 1);
+
             default:
                return LW_UC_UNKNOWN_COMMAND;
         }
@@ -123,7 +129,10 @@ private:
 
         uint8_t fragIx = (buffer[0] >> 4) & 0b11;
 
+        tr_debug("handleFragmentationSetup fragIx=%u", fragIx);
+
         if (fragIx > NB_FRAG_GROUPS - 1) {
+            tr_debug("handleFragmentationSetup: FSAE_IndexNotSupported");
             sendFragSessionAns(FSAE_IndexNotSupported);
             return LW_UC_OK;
         }
@@ -142,6 +151,16 @@ private:
         frag_sessions[fragIx].blockAckDelay = buffer[4] & 0b111;
         frag_sessions[fragIx].padding = buffer[5];
         frag_sessions[fragIx].descriptor = (buffer[9] << 24) + (buffer[8] << 16) + (buffer[7] << 8) + buffer[6];
+
+        tr_debug("FragmentationSessionSetupReq");
+        tr_debug("\tIndex:            %u", fragIx);
+        tr_debug("\tMcGroupBitMask:   %u", frag_sessions[fragIx].mcGroupBitMask);
+        tr_debug("\tNbFrag:           %u", frag_sessions[fragIx].nbFrag);
+        tr_debug("\tFragSize:         %u", frag_sessions[fragIx].fragSize);
+        tr_debug("\tFragAlgo:         %u", frag_sessions[fragIx].fragAlgo);
+        tr_debug("\tBlockAckDelay:    %u", frag_sessions[fragIx].blockAckDelay);
+        tr_debug("\tPadding:          %u", frag_sessions[fragIx].padding);
+        tr_debug("\tDescriptor:       %u", frag_sessions[fragIx].descriptor);
 
         // create a fragmentation session which can handle all this...
         FragmentationSessionOpts_t opts;
@@ -179,16 +198,99 @@ private:
         uint8_t response = 0b0000;
 
         switch (error) {
-            case FSAE_WrongDescriptor: response = 0b1000;
-            case FSAE_IndexNotSupported: response = 0b0100;
-            case FSAE_NotEnoughMemory: response = 0b0010;
-            case FSAE_EncodingUnsupported: response = 0b0001;
-            case FSAE_None: response = 0b0000;
+            case FSAE_WrongDescriptor: response = 0b1000; break;
+            case FSAE_IndexNotSupported: response = 0b0100; break;
+            case FSAE_NotEnoughMemory: response = 0b0010; break;
+            case FSAE_EncodingUnsupported: response = 0b0001; break;
+            case FSAE_None: response = 0b0000; break;
         }
 
-        uint8_t buffer[1];
-        buffer[0] = response;
-        send(FRAGSESSION_PORT, buffer, 1);
+        uint8_t buffer[2];
+        buffer[0] = FRAG_SESSION_SETUP_ANS;
+        buffer[1] = response;
+        send(FRAGSESSION_PORT, buffer, 2);
+    }
+
+    /**
+     * Delete a fragmentation session
+     */
+    LW_UC_STATUS handleFragmentationDeleteReq(uint8_t *buffer, size_t length) {
+        if (length != FRAG_SESSION_DELETE_REQ_LENGTH) {
+            return LW_UC_INVALID_PACKET_LENGTH;
+        }
+
+        uint8_t fragIx = buffer[0] & 0b11;
+
+        tr_debug("handleFragmentationDeleteReq ix=%u", fragIx);
+
+        uint8_t response[FRAG_SESSION_DELETE_ANS_LENGTH] = { FRAG_SESSION_DELETE_ANS, fragIx };
+
+        // fragIndex out of bounds, or not active
+        if (fragIx > NB_FRAG_GROUPS - 1 || frag_sessions[fragIx].active == false) {
+            tr_debug("session is out of bounds or not active");
+
+            // set bit 3 of the response high
+            response[1] += 0b100;
+        }
+
+        send(FRAGSESSION_PORT, response, FRAG_SESSION_DELETE_ANS_LENGTH);
+
+        return LW_UC_OK;
+    }
+
+    /**
+     * Get the status of a fragmentation session
+     */
+    LW_UC_STATUS handleFragmentationStatusReq(uint8_t *buffer, size_t length) {
+        if (length != FRAG_SESSION_STATUS_REQ_LENGTH) {
+            return LW_UC_INVALID_PACKET_LENGTH;
+        }
+
+        uint8_t fragIx = (buffer[0] >> 1) & 0b11;
+
+        if (fragIx > NB_FRAG_GROUPS - 1) {
+            // this is not handled in the specs... ignore?
+            return LW_UC_OK;
+        }
+
+        tr_debug("handleFragmentationStatusReq ix=%u", fragIx);
+
+        // The “participants” bit signals if all the fragmentation receivers should answer or only the ones still missing fragments.
+        // 0 = Only the receivers still missing fragments MUST answer the request
+        // 1 = All receivers MUST answer, even those who already successfully reconstructed the data block
+        uint8_t participants = buffer[0] & 0b1;
+
+        if (participants == 0) {
+            // no active session? OK, done
+            if (!frag_sessions[fragIx].active || frag_sessions[fragIx].session == NULL) {
+                return LW_UC_OK;
+            }
+        }
+
+        // otherwise we need to send an update...
+        // @todo problem is that we don't have the info anymore after we reconstructed
+        if (!frag_sessions[fragIx].active || frag_sessions[fragIx].session == NULL) {
+            // @todo: this is wrong because I don't have the info...
+            return LW_UC_OK;
+        }
+
+        uint16_t nbReceived = frag_sessions[fragIx].session->get_received_frame_count();
+        // upper 2 bits are for the fragIndex
+        nbReceived += (fragIx << 14);
+
+        uint8_t response[FRAG_SESSION_STATUS_ANS_LENGTH] = {
+            FRAG_SESSION_STATUS_ANS,
+            nbReceived >> 8 & 0xff,
+            nbReceived & 0xff,
+            static_cast<uint8_t>(frag_sessions[fragIx].session->get_lost_frame_count()),
+            0 /* whether we're out of memory... i don't think this is possible, because we limit this at compile time */
+        };
+
+        // @todo: delay not implemented
+        // (As described in the “FragSessionStatusReq” command, the receivers MUST respond with a pseudo-random delay as specified by the BlockAckDelay field of the FragSessionSetupReq command.)
+        send(FRAGSESSION_PORT, response, FRAG_SESSION_STATUS_ANS_LENGTH);
+
+        return LW_UC_OK;
     }
 
     /**

@@ -80,11 +80,15 @@ public:
      *
      * @param bd A block device
      * @param appKey Application Key, used to derive session keys from multicast keys
-     * @param send_fn A send function, invoked when we want to relay data back to the network
+     * @param send_fn A send function, invoked when we want to relay data back to the network.
+     *                Messages through this function should be sent as CONFIRMED uplinks.
+     *                This is deliberatly not part of the callbacks structure, because it's a *required*
+     *                part of the update client.
      */
     LoRaWANUpdateClient(BlockDevice *bd, const uint8_t appKey[16], Callback<void(uint8_t, uint8_t*, size_t)> send_fn)
-        : _bd(bd), _send_fn(send_fn), _event_cb(NULL)
+        : _bd(bd), _send_fn(send_fn)
     {
+        // @todo: what if appKey is in secure element?
         memcpy(_appKey, appKey, 16);
 
         for (size_t ix = 0; ix < NB_FRAG_GROUPS; ix++) {
@@ -95,28 +99,34 @@ public:
         for (size_t ix = 0; ix < NB_MC_GROUPS; ix++) {
             mc_groups[ix].active = false;
         }
-    }
 
-    /**
-     * Sets the event callback (will let you know when firmware is complete and ready to flash)
-     * @param fn Callback function
-     */
-    void setEventCallback(Callback<void(LW_UC_EVENT)> fn) {
-        _event_cb = fn;
+        clockSync.gpsTime = 0xffffffff;
+        clockSync.rtcTime = 0xffffffff;
+
+        callbacks.fragSessionComplete = NULL;
+        callbacks.firmwareReady = NULL;
+        callbacks.switchToClassC = NULL;
+        callbacks.switchToClassA = NULL;
     }
 
     /**
      * Handle packets that came in on the fragmentation port (e.g. 201)
+     *
+     * @param devAddr The device address that received this message (or 0x0 in unicast)
+     * @param buffer Data buffer
+     * @param length Length of the data buffer
      */
-    LW_UC_STATUS handleFragmentationCommand(uint8_t *buffer, size_t length) {
+    LW_UC_STATUS handleFragmentationCommand(uint32_t devAddr, uint8_t *buffer, size_t length) {
         if (length == 0) return LW_UC_INVALID_PACKET_LENGTH;
+
+        // @todo: are we going to accept fragSession commands over multicast? That should be unsafe...
 
         switch (buffer[0]) {
             case FRAG_SESSION_SETUP_REQ:
                 return handleFragmentationSetupReq(buffer + 1, length - 1);
 
             case DATA_FRAGMENT:
-                return handleDataFragment(buffer + 1, length - 1);
+                return handleDataFragment(devAddr, buffer + 1, length - 1);
 
             case FRAG_SESSION_DELETE_REQ:
                 return handleFragmentationDeleteReq(buffer + 1, length - 1);
@@ -148,6 +158,9 @@ public:
             case MC_GROUP_STATUS_REQ:
                 return handleMulticastStatusReq(buffer + 1, length - 1);
 
+            case MC_CLASSC_SESSION_REQ:
+                return handleMulticastClassCSessionReq(buffer + 1, length - 1);
+
             case PACKAGE_VERSION_REQ:
                 return handleMulticastPackageVersionReq(buffer + 1, length - 1);
 
@@ -155,6 +168,25 @@ public:
                return LW_UC_UNKNOWN_COMMAND;
         }
     }
+
+    /**
+     * Out of band synchronisation between RTC and GPS clock.
+     * Required for starting a Class C session.
+     * RTC value is ready from the Mbed APIs, so no need to provide this (@todo: should be pluggable for external RTC).
+     *
+     * @param gpsTime   Current time in seconds since 00:00:00, Sunday 6th of January 1980 (start of the GPS epoch)
+     */
+    void outOfBandClockSync(uint32_t gpsTime) {
+        clockSync.rtcTime = get_rtc_time_s();
+        clockSync.gpsTime = gpsTime;
+    }
+
+    /**
+     * Callbacks to set that get invoked when state changes internally.
+     *
+     * This allows us to be independent of the underlying LoRaWAN stack.
+     */
+    LoRaWANUpdateClientCallbacks_t callbacks;
 
 private:
 
@@ -343,6 +375,72 @@ private:
     }
 
     /**
+     * This message is only used to setup a temporary classC multicast session associated with a multicast context.
+     */
+    LW_UC_STATUS handleMulticastClassCSessionReq(uint8_t *buffer, size_t length) {
+        if (length != MC_CLASSC_SESSION_REQ_LENGTH) {
+            return LW_UC_INVALID_PACKET_LENGTH;
+        }
+
+        uint8_t mcIx = buffer[0] & 0b11;
+
+        tr_debug("handleMulticastClassCSessionReq mcIx=%u", mcIx);
+
+        uint8_t response[MC_CLASSC_SESSION_ANS_LENGTH] = { MC_CLASSC_SESSION_ANS, mcIx, 0, 0, 0 };
+
+        if (mcIx > NB_MC_GROUPS - 1 || mc_groups[mcIx].active == false) {
+            tr_debug("mcIx out of bounds or not active");
+            response[1] += 0b10000; // McGroupUndefined
+            send(MCCONTROL_PORT, response, 2); // omit the timeToStart (last 3 bytes)
+            return LW_UC_OK;
+        }
+
+        // No clock synchronisation done
+        if (clockSync.gpsTime == 0xffffffff || clockSync.rtcTime == 0xffffffff) {
+            tr_error("no accurate time known - abort");
+            // @todo: not handled in protocol
+            response[1] += 0b10000; // McGroupUndefined
+            send(MCCONTROL_PORT, response, 2); // omit the timeToStart (last 3 bytes)
+            return LW_UC_OK;
+        }
+
+        // the start of the Class C window, and is expressed as the time in seconds since 00:00:00, Sunday 6th of January 1980 (start of the GPS epoch) modulo 2^32.
+        mc_groups[mcIx].params.sessionTime = (buffer[4] << 24) + (buffer[3] << 16) + (buffer[2] << 8) + buffer[1];
+        mc_groups[mcIx].params.timeOut = pow(2.0f, static_cast<int>(buffer[5] & 0b1111));
+        mc_groups[mcIx].params.dlFreq = ((buffer[8] << 16) + (buffer[7] << 8) + buffer[6]) * 100;
+        mc_groups[mcIx].params.dr = buffer[9];
+
+        // ok... so now we need to know the current time based on clockSync and RTC
+        uint64_t currTime = (get_rtc_time_s() - clockSync.rtcTime) + clockSync.gpsTime;
+
+        uint32_t timeToStart;
+
+        if (mc_groups[mcIx].params.sessionTime < (currTime % 4294967296 /*pow(2, 32)*/)) {
+            tr_warn("ClassCSessionReq for time in the past... Starting it immediately");
+            timeToStart = 0;
+        }
+        else {
+            timeToStart = mc_groups[mcIx].params.sessionTime - static_cast<uint32_t>(currTime % 4294967296 /*pow(2, 32)*/);
+        }
+
+        tr_debug("\ttimeToStart:       %u", timeToStart);
+        tr_debug("\ttimeOut:           %u", mc_groups[mcIx].params.timeOut);
+        tr_debug("\tdlFreq:            %u", mc_groups[mcIx].params.dlFreq);
+        tr_debug("\tdataRate:          %u", mc_groups[mcIx].params.dr);
+
+        response[2] = timeToStart & 0xff;
+        response[3] = timeToStart >> 8 & 0xff;
+        response[4] = timeToStart >> 16 & 0xff;
+
+        mc_groups[mcIx].startTimeout.attach(callback(this, &LoRaWANUpdateClient::mc_start_irq), static_cast<float>(timeToStart));
+        mc_groups[mcIx].timeoutTimeout.attach(callback(this, &LoRaWANUpdateClient::mc_timeout_irq),
+            static_cast<float>(timeToStart + mc_groups[mcIx].params.timeOut));
+
+        send(MCCONTROL_PORT, response, MC_CLASSC_SESSION_ANS_LENGTH);
+        return LW_UC_OK;
+    }
+
+    /**
      * Start a new fragmentation session
      */
     LW_UC_STATUS handleFragmentationSetupReq(uint8_t *buffer, size_t length) {
@@ -356,7 +454,7 @@ private:
         tr_debug("handleFragmentationSetup fragIx=%u", fragIx);
 
         if (fragIx > NB_FRAG_GROUPS - 1) {
-            tr_debug("handleFragmentationSetup: FSAE_IndexNotSupported");
+            tr_debug("FSAE_IndexNotSupported");
             sendFragSessionAns(FSAE_IndexNotSupported);
             return LW_UC_OK;
         }
@@ -534,15 +632,27 @@ private:
 
     /**
      * Handle a data fragment packet
+     * @param devAddr
      * @param buffer
      * @param length
      */
-    LW_UC_STATUS handleDataFragment(uint8_t *buffer, size_t length) {
+    LW_UC_STATUS handleDataFragment(uint32_t devAddr, uint8_t *buffer, size_t length) {
+        // always need at least 2 bytes for the indexAndN
+        if (length < 2) return LW_UC_INVALID_PACKET_LENGTH;
+
         // top 2 bits are the fragSessionIx, other 16 bits are the pkgIndex
         uint16_t indexAndN = (buffer[1] << 8) + buffer[0];
 
         uint8_t fragIx = indexAndN >> 14;
         uint16_t frameCounter = indexAndN & 16383;
+
+        // if this message was sent on a multicast group, make sure to reset the timeout
+        MulticastGroupParams_t *mcGroup = mcGroupFromDevAddr(devAddr);
+        if (mcGroup != NULL) {
+            // @todo: there's another check that we need to do here around the frame counter min/max...
+            mcGroup->timeoutTimeout.attach(callback(this, &LoRaWANUpdateClient::mc_timeout_irq),
+                static_cast<float>(mcGroup->params.timeOut));
+        }
 
         if (!frag_sessions[fragIx].active) return LW_UC_FRAG_SESSION_NOT_ACTIVE;
         if (!frag_sessions[fragIx].session) return LW_UC_FRAG_SESSION_NOT_ACTIVE;
@@ -555,8 +665,8 @@ private:
 
         if (result == FRAG_COMPLETE) {
             tr_debug("FragSession complete");
-            if (_event_cb) {
-                _event_cb(LW_UC_EVENT_FRAGSESSION_COMPLETE);
+            if (callbacks.fragSessionComplete) {
+                callbacks.fragSessionComplete();
             }
 
             // clear the session to re-claim memory
@@ -595,8 +705,8 @@ private:
 
                 if (authStatus != LW_UC_OK) return authStatus;
 
-                if (_event_cb) {
-                    _event_cb(LW_UC_EVENT_FIRMWARE_READY);
+                if (callbacks.firmwareReady) {
+                    callbacks.firmwareReady();
                 }
 
                 return LW_UC_OK;
@@ -619,8 +729,8 @@ private:
 
                 if (authStatus != LW_UC_OK) return authStatus;
 
-                if (_event_cb) {
-                    _event_cb(LW_UC_EVENT_FIRMWARE_READY);
+                if (callbacks.firmwareReady) {
+                    callbacks.firmwareReady();
                 }
 
                 return LW_UC_OK;
@@ -670,7 +780,7 @@ private:
 
         // now check that the signature is correct...
         {
-            tr_debug("Expected ECDSA signature is: ");
+            tr_debug("ECDSA signature is: ");
             for (size_t ix = 0; ix < header->signature_length; ix++) {
                 printf("%02x", header->signature[ix]);
             }
@@ -812,6 +922,21 @@ private:
     }
 
     /**
+     * Find an active multicast group based on device address
+     */
+    MulticastGroupParams_t *mcGroupFromDevAddr(uint32_t devAddr) {
+        if (devAddr == 0x0) return NULL;
+
+        for (size_t ix = 0; ix < NB_MC_GROUPS; ix++) {
+            if (mc_groups[ix].active && mc_groups[ix].mcAddr == devAddr) {
+                return &(mc_groups[ix]);
+            }
+        }
+
+        return NULL;
+    }
+
+    /**
      * Relay message back to network server - to be provided by the caller of this client
      */
     void send(uint8_t port, uint8_t *data, size_t length) {
@@ -856,15 +981,51 @@ private:
         }
     }
 
+    /**
+     * Get the value of the RTC in seconds
+     */
+    uint32_t get_rtc_time_s() {
+        return static_cast<uint32_t>(mbed_uptime() / 1000L / 1000L);
+    }
+
+    /**
+     * Multicast starting IRQ - indicates when to switch to Class C
+     *
+     * @todo: the way that this is designed right now makes it impossible to have multiple class C sessions active
+     *        one way around would be to use an eventqueue and add some state to the event...
+     *        or we can bind this to the MulticastGroupParams_t object (but would need to be a class, not a struct)
+     *        - not really a problem in the current implementation as we limit to 1 group, but should be fixed
+     */
+    void mc_start_irq() {
+        for (size_t ix = 0; ix < NB_MC_GROUPS; ix++) {
+            if (mc_groups[ix].active && callbacks.switchToClassC) {
+                callbacks.switchToClassC(mc_groups[ix].mcAddr, mc_groups[ix].nwkSKey, mc_groups[ix].appSKey);
+            }
+        }
+    }
+
+    /**
+     * Multicast timeout IRQ - indicates when to switch back to Class A
+     *
+     * @todo: see mc_start_irq - same problems arise here
+     */
+    void mc_timeout_irq() {
+        for (size_t ix = 0; ix < NB_MC_GROUPS; ix++) {
+            if (mc_groups[ix].active && callbacks.switchToClassA) {
+                callbacks.switchToClassA();
+            }
+        }
+    }
+
     // store fragmentation groups here...
     FragmentationSessionParams_t frag_sessions[NB_FRAG_GROUPS];
     MulticastGroupParams_t mc_groups[NB_MC_GROUPS];
+    ClockSync_t clockSync;
 
     // external storage
     FragmentationBlockDeviceWrapper _bd;
     uint8_t _appKey[16];
     Callback<void(uint8_t, uint8_t*, size_t)> _send_fn;
-    Callback<void(LW_UC_EVENT)> _event_cb;
 };
 
 #endif // _LORAWAN_UPDATE_CLIENT_H_

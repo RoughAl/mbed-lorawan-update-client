@@ -40,14 +40,14 @@
 #define MC_GROUP_DELETE_ANS 0x03
 #define MC_CLASSC_SESSION_REQ  0x04
 #define MC_CLASSC_SESSION_ANS  0x04
-#define MC_CLASSC_SESSION_REQ_LENGTH 0xa
-#define MC_CLASSC_SESSION_ANS_LENGTH 0x5
 
 #define MC_GROUP_SETUP_REQ_LENGTH 29
 #define MC_GROUP_SETUP_ANS_LENGTH 2
 #define MC_GROUP_DELETE_REQ_LENGTH 1
 #define MC_GROUP_DELETE_ANS_LENGTH 2
 #define MC_GROUP_STATUS_REQ_LENGTH 1
+#define MC_CLASSC_SESSION_REQ_LENGTH 10
+#define MC_CLASSC_SESSION_ANS_LENGTH 5
 
 #define FRAG_SESSION_STATUS_REQ 0x01
 #define FRAG_SESSION_STATUS_ANS 0x01
@@ -73,11 +73,6 @@
 #define FRAGMENTATION_FINISH 0x0
 
 typedef struct {
-  	/**
-     * McGroupID is the identifier of the multicast group being used.
-     */
-    uint8_t mcGroupIDHeader;
-
     /**
      * SessionTime is the start of the Class C window, and is expressed as the time in
      * seconds since 00:00:00, Sunday 6th of January 1980 (start of the GPS epoch) modulo 2^32.
@@ -88,18 +83,16 @@ typedef struct {
     /**
      * TimeOut encodes the maximum length in seconds of the multicast session
      * (max time the end-device stays in class C before reverting to class A to save battery)
-     * The maximum duration in second is 2^TimeOut (Example: TimeOut=8 means 256 seconds)
      * This is a maximum duration because the end-device’s application might decide to revert
      * to class A before the end of the session, this decision is application specific.
      */
-    uint8_t sessionTimeOut;
+    uint32_t timeOut;
 
     /**
-     * Encodes the frequency used for the multicast. This field is a 24 bits unsigned integer.
-     * The actual channel frequency in Hz is 100 x DlFrequ whereby values representing frequencies
-     * below 100 MHz are reserved for future use. This allows setting the frequency of a channel
+     * Frequency used for the multicast in Hz.
+     * Values representing frequencies below 100 MHz are reserved for future use.
+     * This allows setting the frequency of a channel
      * anywhere between 100 MHz to 1.67 GHz in 100 Hz steps.
-     * This field has the same meaning and coding as LoRaWAN NewChannelReq MAC command ‘Freq’ field.
      */
 	uint32_t dlFreq;
 
@@ -159,7 +152,26 @@ typedef struct {
     /**
      * Class C session parameters
      */
-    McClassCSessionParams_t session;
+    McClassCSessionParams_t params;
+
+    /**
+     * Timeout to start the multicast session
+     */
+#if defined (DEVICE_LPTICKER)
+    LowPowerTimeout startTimeout;
+#else
+    Timeout startTimeout;
+#endif
+
+    /**
+     * Ticker for the timeout, will switch out of the multicast session
+     */
+#if defined (DEVICE_LPTICKER)
+    LowPowerTimeout timeoutTimeout;
+#else
+    Timeout timeoutTimeout;
+#endif
+
 } MulticastGroupParams_t;
 
 typedef struct {
@@ -246,6 +258,11 @@ typedef struct {
 
 } FragmentationSessionParams_t;
 
+typedef struct {
+    uint32_t rtcTime;
+    uint32_t gpsTime;
+} ClockSync_t;
+
 enum FragmenationSessionAnswerErrors {
     FSAE_WrongDescriptor = 3,
     FSAE_IndexNotSupported = 2,
@@ -253,5 +270,31 @@ enum FragmenationSessionAnswerErrors {
     FSAE_EncodingUnsupported = 0,
     FSAE_None = -1
 };
+
+typedef struct {
+
+    /**
+     * Callback when a fragmentation session is complete
+     */
+    Callback<void()> fragSessionComplete;
+
+    /**
+     * Firmware has been written and is ready, callback to restart the device to apply the update
+     */
+    Callback<void()> firmwareReady;
+
+    /**
+     * Switch to Class C callback.
+     * **Note: This runs in an ISR!**
+     */
+    Callback<void(uint32_t, uint8_t*, uint8_t*)> switchToClassC;
+
+    /**
+     * Switch to Class A callback
+     * **Note: This runs in an ISR!**
+     */
+    Callback<void()> switchToClassA;
+
+} LoRaWANUpdateClientCallbacks_t;
 
 #endif

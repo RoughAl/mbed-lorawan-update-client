@@ -299,22 +299,47 @@ private:
             return LW_UC_INVALID_PACKET_LENGTH;
         }
 
+        // @todo... if a MC group is not active what am I supposed to send? the spec is not clear.
+        // I guess we need to discard it because we cannot give status on a non-existing group.
+
+        // max length of the response is 1 byte status + 5 bytes per group...
+        uint8_t response[2 + (NB_MC_GROUPS * 5)];
+
+        uint8_t reqGroupMask = buffer[0] & 0b1111;
+
+        uint8_t ansGroupMask = 0;
+        uint8_t totalGroups = 0;
+
+        // iterate over the response
+        uint8_t *resp_ptr = response + 2;
+
+        for (size_t ix = 0; ix < NB_MC_GROUPS; ix++) {
+            bool requested = (reqGroupMask >> ix) & 0b1;
+
+            if (requested && mc_groups[ix].active) {
+                totalGroups++;
+                ansGroupMask += (1 << ix);
+
+                resp_ptr[0] = ix;
+                resp_ptr[1] = mc_groups[ix].mcAddr & 0xff;
+                resp_ptr[2] = mc_groups[ix].mcAddr >> 8 & 0xff;
+                resp_ptr[3] = mc_groups[ix].mcAddr >> 16 & 0xff;
+                resp_ptr[4] = mc_groups[ix].mcAddr >> 24 & 0xff;
+
+                resp_ptr += 5;
+            }
+        }
+
+        // add the total groups to the mask
+        ansGroupMask += (totalGroups << 4);
+
+        response[0] = MC_GROUP_STATUS_ANS;
+        response[1] = ansGroupMask;
+
+        // if we didn't use the full response, just cut it off here
+        send(MCCONTROL_PORT, response, 2 + (totalGroups * 5));
+
         return LW_UC_OK;
-
-        // uint8_t response[1 + ()]
-
-        // uint8_t reqGroupMask = buffer[0] & 0b1111;
-
-        // uint8_t ansGroupMask = 0;
-
-        // for (size_t ix = 0; ix < NB_MC_GROUPS; ix++) {
-        //     bool requested = (reqGroupMask >> ix) & 0b1;
-
-        //     if (requested) {
-        //         ansGroupMask += (1 << ix);
-
-        //     }
-        // }
     }
 
     /**

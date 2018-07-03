@@ -28,6 +28,7 @@
 #include "arm_uc_metadata_header_v2.h"
 #include "update_params.h"
 #include "update_types.h"
+#include "tiny-aes.h"   // @todo: replace by Mbed TLS / hw crypto?
 
 #include "mbed_trace.h"
 #define TRACE_GROUP "LWUC"
@@ -36,13 +37,17 @@
 #define NB_FRAG_GROUPS          1
 #endif // NB_FRAG_GROUPS
 
+#ifndef NB_MC_GROUPS
+#define NB_MC_GROUPS          1
+#endif // NB_MC_GROUPS
+
 #ifndef LW_UC_SHA256_BUFFER_SIZE
 #define LW_UC_SHA256_BUFFER_SIZE       128
-#endif
+#endif // LW_UC_SHA256_BUFFER_SIZE
 
 #ifndef LW_UC_JANPATCH_BUFFER_SIZE
 #define LW_UC_JANPATCH_BUFFER_SIZE     528
-#endif
+#endif // LW_UC_JANPATCH_BUFFER_SIZE
 
 enum LW_UC_STATUS {
     LW_UC_OK = 0,
@@ -73,15 +78,22 @@ public:
     /**
      * Initialize a new LoRaWANUpdateClient
      *
-     * @params bd A block device
-     * @params send_fn A send function, invoked when we want to relay data back to the network
+     * @param bd A block device
+     * @param appKey Application Key, used to derive session keys from multicast keys
+     * @param send_fn A send function, invoked when we want to relay data back to the network
      */
-    LoRaWANUpdateClient(BlockDevice *bd, Callback<void(uint8_t, uint8_t*, size_t)> send_fn)
+    LoRaWANUpdateClient(BlockDevice *bd, const uint8_t appKey[16], Callback<void(uint8_t, uint8_t*, size_t)> send_fn)
         : _bd(bd), _send_fn(send_fn), _event_cb(NULL)
     {
+        memcpy(_appKey, appKey, 16);
+
         for (size_t ix = 0; ix < NB_FRAG_GROUPS; ix++) {
             frag_sessions[ix].active = false;
             frag_sessions[ix].session = NULL;
+        }
+
+        for (size_t ix = 0; ix < NB_MC_GROUPS; ix++) {
+            mc_groups[ix].active = false;
         }
     }
 
@@ -113,7 +125,31 @@ public:
                 return handleFragmentationStatusReq(buffer + 1, length - 1);
 
             case PACKAGE_VERSION_REQ:
-                return handlePackageVersionReq(buffer + 1, length - 1);
+                return handleFragmentationPackageVersionReq(buffer + 1, length - 1);
+
+            default:
+               return LW_UC_UNKNOWN_COMMAND;
+        }
+    }
+
+    /**
+     * Handle packets that came in on the multicast control port (e.g. 200)
+     */
+    LW_UC_STATUS handleMulticastControlCommand(uint8_t *buffer, size_t length) {
+        if (length == 0) return LW_UC_INVALID_PACKET_LENGTH;
+
+        switch (buffer[0]) {
+            case MC_GROUP_SETUP_REQ:
+                return handleMulticastSetupReq(buffer + 1, length - 1);
+
+            case MC_GROUP_DELETE_REQ:
+                return handleMulticastDeleteReq(buffer + 1, length - 1);
+
+            case MC_GROUP_STATUS_REQ:
+                return handleMulticastStatusReq(buffer + 1, length - 1);
+
+            case PACKAGE_VERSION_REQ:
+                return handleMulticastPackageVersionReq(buffer + 1, length - 1);
 
             default:
                return LW_UC_UNKNOWN_COMMAND;
@@ -121,6 +157,166 @@ public:
     }
 
 private:
+
+    /**
+     * Used by the AS to request the package version implemented by the end-device
+     */
+    LW_UC_STATUS handleMulticastPackageVersionReq(uint8_t *buffer, size_t length) {
+        if (length != 0) {
+            return LW_UC_INVALID_PACKET_LENGTH;
+        }
+
+        // The identifier of the fragmentation transport package is 2. The version of this package is version 1.
+        uint8_t response[PACKAGE_VERSION_ANS_LENGTH] = { PACKAGE_VERSION_ANS, 2, 1 };
+        send(MCCONTROL_PORT, response, PACKAGE_VERSION_ANS_LENGTH);
+
+        return LW_UC_OK;
+    }
+
+    /**
+     * This command is used to create or modify the parameters of a multicast group.
+     */
+    LW_UC_STATUS handleMulticastSetupReq(uint8_t *buffer, size_t length) {
+        if (length != MC_GROUP_SETUP_REQ_LENGTH) {
+            // @todo, I assume we need to send a FRAG_SESSION_SETUP_ANS at this point... But not listed in the spec.
+            return LW_UC_INVALID_PACKET_LENGTH;
+        }
+
+        uint8_t mcIx = buffer[0] & 0b11;
+
+        tr_debug("handleMulticastSetupReq mcIx=%u", mcIx);
+
+        if (mcIx > NB_MC_GROUPS - 1) {
+            tr_debug("handleMulticastSetupReq: mcIx out of bounds");
+            return sendMulticastSetupAns(true, mcIx);
+        }
+
+        // @todo: so the spec allows us to modify a group
+        // but what if we're currently in class C mode - how should we change the parameters?
+
+        mc_groups[mcIx].mcAddr = (buffer[4] << 24) + (buffer[3] << 16) + (buffer[2] << 8) + buffer[1];
+        memcpy(mc_groups[mcIx].mcKey_Encrypted, buffer + 5, 16);
+        mc_groups[mcIx].minFcFCount = (buffer[24] << 24) + (buffer[23] << 16) + (buffer[22] << 8) + buffer[21];
+        mc_groups[mcIx].maxFcFCount = (buffer[28] << 24) + (buffer[27] << 16) + (buffer[26] << 8) + buffer[25];
+
+        // Derived from the AppKey.  LoRaWAN 1.1+ end-devices SHALL use this scheme.
+        // McRootKey = aes128_encrypt(AppKey, 0x20 | pad16)
+        const uint8_t mc_root_key_input[16] = { 0x20, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 };
+        uint8_t mc_root_key_output[16] = {};
+        AES_ECB_encrypt(mc_root_key_input, _appKey, mc_root_key_output, 16);
+
+        // McKEKey = aes128_encrypt(McRootKey, 0x00 | pad16)
+        const uint8_t mc_e_key_input[16] = { 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 };
+        uint8_t mc_e_key_output[16];
+        AES_ECB_encrypt(mc_e_key_input, mc_root_key_output, mc_e_key_output, 16);
+
+        // McKey = aes128_encrypt(McKEKey, McKey_encrypted)
+        uint8_t mc_key[16];
+        AES_ECB_encrypt(mc_groups[mcIx].mcKey_Encrypted, mc_e_key_output, mc_key, 16);
+
+        // The McAppSKey and the McNetSKey are then derived from the group’s McKey as follow:
+        // McAppSKey = aes128_encrypt(McKey, 0x01 | McAddr | pad16)
+        // McNetSKey = aes128_encrypt(McKey, 0x02 | McAddr | pad16)
+        const uint8_t nwk_input[16] = { 0x01, buffer[1], buffer[2], buffer[3], buffer[4], 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 };
+        const uint8_t app_input[16] = { 0x02, buffer[1], buffer[2], buffer[3], buffer[4], 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 };
+
+        AES_ECB_encrypt(nwk_input, mc_key, mc_groups[mcIx].nwkSKey, 16);
+        AES_ECB_encrypt(app_input, mc_key, mc_groups[mcIx].appSKey, 16);
+
+        mc_groups[mcIx].active = true;
+
+        tr_debug("\tmcAddr:         0x%08x", mc_groups[mcIx].mcAddr);
+        tr_debug("\tNwkSKey:");
+        printf("\t         ");
+        for (size_t ix = 0; ix < 16; ix++) {
+            printf("%02x ", mc_groups[mcIx].nwkSKey[ix]);
+        }
+        printf("\n");
+        tr_debug("\tAppSKey:");
+        printf("\t         ");
+        for (size_t ix = 0; ix < 16; ix++) {
+            printf("%02x ", mc_groups[mcIx].appSKey[ix]);
+        }
+        printf("\n");
+        tr_debug("\tminFcFCount:    %u", mc_groups[mcIx].minFcFCount);
+        tr_debug("\tmaxFcFCount:    %u", mc_groups[mcIx].maxFcFCount);
+
+        return sendMulticastSetupAns(false, mcIx);
+    }
+
+    /**
+     * Send FRAG_SESSION_ANS to network server with bits set depending on the error indicator
+     */
+    LW_UC_STATUS sendMulticastSetupAns(bool error, uint8_t mcIx) {
+        uint8_t resp = mcIx;
+        resp += error ? 0b100 : 0;
+
+        uint8_t buffer[MC_GROUP_SETUP_ANS_LENGTH] = { MC_GROUP_SETUP_ANS, resp };
+        send(MCCONTROL_PORT, buffer, MC_GROUP_SETUP_ANS_LENGTH);
+
+        return LW_UC_OK;
+    }
+
+    /**
+     * This message is used to delete a multicast group from an end-device.
+     */
+    LW_UC_STATUS handleMulticastDeleteReq(uint8_t *buffer, size_t length) {
+        if (length != MC_GROUP_DELETE_REQ_LENGTH) {
+            return LW_UC_INVALID_PACKET_LENGTH;
+        }
+
+        uint8_t mcIx = buffer[0] & 0b11;
+
+        tr_debug("handleMulticastDeleteReq mcIx=%u", mcIx);
+
+        uint8_t response[MC_GROUP_DELETE_ANS_LENGTH] = { MC_GROUP_DELETE_ANS, mcIx };
+
+        if (mcIx > NB_MC_GROUPS - 1 || !mc_groups[mcIx].active) {
+            // set error flag
+            response[1] += 0b100;
+        }
+
+        mc_groups[mcIx].active = false;
+
+        // clear potentially sensitive details
+        mc_groups[mcIx].mcAddr = 0x0;
+        memset(mc_groups[mcIx].mcKey_Encrypted, 0, 16);
+        memset(mc_groups[mcIx].nwkSKey, 0, 16);
+        memset(mc_groups[mcIx].appSKey, 0, 16);
+        mc_groups[mcIx].minFcFCount = 0;
+        mc_groups[mcIx].maxFcFCount = 0;
+
+        send(MCCONTROL_PORT, response, MC_GROUP_DELETE_ANS_LENGTH);
+
+        return LW_UC_OK;
+    }
+
+    /**
+     * Get the status of the active multicast groups
+     */
+    LW_UC_STATUS handleMulticastStatusReq(uint8_t *buffer, size_t length) {
+        if (length != MC_GROUP_STATUS_REQ_LENGTH) {
+            return LW_UC_INVALID_PACKET_LENGTH;
+        }
+
+        return LW_UC_OK;
+
+        // uint8_t response[1 + ()]
+
+        // uint8_t reqGroupMask = buffer[0] & 0b1111;
+
+        // uint8_t ansGroupMask = 0;
+
+        // for (size_t ix = 0; ix < NB_MC_GROUPS; ix++) {
+        //     bool requested = (reqGroupMask >> ix) & 0b1;
+
+        //     if (requested) {
+        //         ansGroupMask += (1 << ix);
+
+        //     }
+        // }
+    }
+
     /**
      * Start a new fragmentation session
      */
@@ -299,7 +495,7 @@ private:
     /**
      * Used by the AS to request the package version implemented by the end-device
      */
-    LW_UC_STATUS handlePackageVersionReq(uint8_t *buffer, size_t length) {
+    LW_UC_STATUS handleFragmentationPackageVersionReq(uint8_t *buffer, size_t length) {
         if (length != 0) {
             return LW_UC_INVALID_PACKET_LENGTH;
         }
@@ -637,9 +833,11 @@ private:
 
     // store fragmentation groups here...
     FragmentationSessionParams_t frag_sessions[NB_FRAG_GROUPS];
+    MulticastGroupParams_t mc_groups[NB_MC_GROUPS];
 
     // external storage
     FragmentationBlockDeviceWrapper _bd;
+    uint8_t _appKey[16];
     Callback<void(uint8_t, uint8_t*, size_t)> _send_fn;
     Callback<void(LW_UC_EVENT)> _event_cb;
 };

@@ -21,11 +21,13 @@
 #include "mbed.h"
 #include "FragmentationSession.h"
 
-#define LORAWAN_APP_PROTOCOL_DATA_MAX_SIZE 100
-#define LORAWAN_PROTOCOL_DEFAULT_DATARATE DR_5
-
+#ifndef FRAGSESSION_PORT
 #define FRAGSESSION_PORT 201
-#define MCSETUP_PORT     202
+#endif
+
+#ifndef MCCONTROL_PORT
+#define MCCONTROL_PORT   200
+#endif
 
 #define PACKAGE_VERSION_REQ 0x0
 #define PACKAGE_VERSION_ANS 0x0
@@ -40,10 +42,12 @@
 #define MC_CLASSC_SESSION_ANS  0x04
 #define MC_CLASSC_SESSION_REQ_LENGTH 0xa
 #define MC_CLASSC_SESSION_ANS_LENGTH 0x5
-#define FRAGMENTATION_ON_GOING 0xFFFFFFFF
-#define FRAGMENTATION_NOT_STARTED 0xFFFFFFFE
-#define FRAGMENTATION_FINISH 0x0
-#define MAX_UPLINK_T0_UIFCNTREF 0x3
+
+#define MC_GROUP_SETUP_REQ_LENGTH 29
+#define MC_GROUP_SETUP_ANS_LENGTH 2
+#define MC_GROUP_DELETE_REQ_LENGTH 1
+#define MC_GROUP_DELETE_ANS_LENGTH 2
+#define MC_GROUP_STATUS_REQ_LENGTH 1
 
 #define FRAG_SESSION_STATUS_REQ 0x01
 #define FRAG_SESSION_STATUS_ANS 0x01
@@ -55,97 +59,108 @@
 #define DATA_BLOCK_AUTH_ANS  0x05
 #define DATA_FRAGMENT  0x08
 
-#define PACKAGE_VERSION_REQ_LENGTH 0x0
-#define PACKAGE_VERSION_ANS_LENGTH 0x3
-#define FRAG_SESSION_SETUP_REQ_LENGTH 0x0A
-#define FRAG_SESSION_SETUP_ANS_LENGTH 0x2
-#define FRAG_SESSION_DELETE_REQ_LENGTH 0x1
-#define FRAG_SESSION_DELETE_ANS_LENGTH 0x2
-#define FRAG_SESSION_STATUS_REQ_LENGTH 0x1
-#define FRAG_SESSION_STATUS_ANS_LENGTH 0x5
+#define PACKAGE_VERSION_REQ_LENGTH 0
+#define PACKAGE_VERSION_ANS_LENGTH 3
+#define FRAG_SESSION_SETUP_REQ_LENGTH 10
+#define FRAG_SESSION_SETUP_ANS_LENGTH 2
+#define FRAG_SESSION_DELETE_REQ_LENGTH 1
+#define FRAG_SESSION_DELETE_ANS_LENGTH 2
+#define FRAG_SESSION_STATUS_REQ_LENGTH 1
+#define FRAG_SESSION_STATUS_ANS_LENGTH 5
 
-#define DATA_BLOCK_AUTH_REQ_LENGTH 0xa
-#define LORAWAN_APP_FTM_PACKAGE_DATA_MAX_SIZE 20
+#define FRAGMENTATION_ON_GOING 0xFFFFFFFF
+#define FRAGMENTATION_NOT_STARTED 0xFFFFFFFE
+#define FRAGMENTATION_FINISH 0x0
 
-#define DELAY_BW2FCNT  10 // 5s
-#define STATUS_ERROR 1
-#define STATUS_OK 0
-
-typedef struct sMcGroupSetParams {
-    uint8_t McGroupIDHeader;
-
-    uint32_t McAddr;
-
-    uint8_t McKey[16];
-
-    uint16_t McCountMSB;
-
-    uint32_t Validity;
-} McGroupSetParams_t;
-
-/*!
- * Global  McClassCSession parameters
- */
-typedef struct sMcClassCSessionParams
-{
-  	/*!
-     * is the identifier of the multicast  group being used.
+typedef struct {
+  	/**
+     * McGroupID is the identifier of the multicast group being used.
      */
-    uint8_t McGroupIDHeader ;
-    /*!
-     * encodes the maximum length in seconds of the multicast fragmentation session
+    uint8_t mcGroupIDHeader;
+
+    /**
+     * SessionTime is the start of the Class C window, and is expressed as the time in
+     * seconds since 00:00:00, Sunday 6th of January 1980 (start of the GPS epoch) modulo 2^32.
+     * Note that this is the same format as the Time field in the beacon frame.
      */
-    uint32_t TimeOut;
+    uint32_t sessionTime;
 
-    /*!
-     * encodes the maximum length in seconds of the multicast fragmentation session
+    /**
+     * TimeOut encodes the maximum length in seconds of the multicast session
+     * (max time the end-device stays in class C before reverting to class A to save battery)
+     * The maximum duration in second is 2^TimeOut (Example: TimeOut=8 means 256 seconds)
+     * This is a maximum duration because the end-device’s application might decide to revert
+     * to class A before the end of the session, this decision is application specific.
      */
-    uint32_t TimeToStart;
+    uint8_t sessionTimeOut;
 
-	  /*!
-     * encodes the maximum length in seconds of the multicast fragmentation session ans
+    /**
+     * Encodes the frequency used for the multicast. This field is a 24 bits unsigned integer.
+     * The actual channel frequency in Hz is 100 x DlFrequ whereby values representing frequencies
+     * below 100 MHz are reserved for future use. This allows setting the frequency of a channel
+     * anywhere between 100 MHz to 1.67 GHz in 100 Hz steps.
+     * This field has the same meaning and coding as LoRaWAN NewChannelReq MAC command ‘Freq’ field.
      */
-     int32_t TimeToStartRec;
+	uint32_t dlFreq;
 
-  	/*!
-     * equal to the 8LSBs of the device�s uplink frame counter used by the network as the reference to provide the session timing information
+    /**
+     * index of the data rate used for the multicast.
+     * Uses the same look-up table than the one used by the LinkAdrReq MAC command of the LoRaWAN protocol.
      */
-    uint8_t UlFCountRef;
+    uint8_t dr;
 
-	  /*!
-     * reception frequency
+} McClassCSessionParams_t;
+
+typedef struct {
+
+    /**
+     * Whether the group is active
      */
-    uint32_t DLFrequencyClassCSession;
+    bool active;
 
-	   /*!
-     * datarate of the current class c session
+    /**
+     * McAddr is the multicast group network address.
+     * McAddr is negotiated off-band by the application server with the network server.
      */
-    uint8_t DataRateClassCSession ;
+    uint32_t mcAddr;
 
-		 /*!
-     * bit signals the server that the timing information of the uplink
-		 * specified by UlFCounter is no longer available
+    /**
+     * McKey_encrypted is the encrypted multicast group key from which McAppSKey and McNetSKey will be derived.
+     * The McKey_encrypted key can be decrypted using the following operation to give the multicast group’s McKey.
+     * McKey = aes128_encrypt(McKEKey, McKey_encrypted)
      */
-    uint8_t UlFCounterError ;
+    uint8_t mcKey_Encrypted[16];
 
-}McClassCSessionParams_t;
-
-
-/*!
- * Global  DataBlockTransport parameters
- */
-typedef struct sDataBlockTransportParams
-{
-    /*!
-     * Channels TX power
+    /**
+     * Network session key (derived from mcKey_Encrypted)
      */
-    int8_t ChannelsTxPower;
-    /*!
-     * Channels data rate
-     */
-    int8_t ChannelsDatarate;
+    uint8_t nwkSKey[16];
 
-}DataBlockTransportParams_t;
+    /**
+     * Application session key (derived from mcKey_Encrypted)
+     */
+    uint8_t appSKey[16];
+
+    /**
+     * The minMcFCount field is the next frame counter value of the multicast downlink to be sent by the server
+     * for this group. This information is required in case an end-device is added to a group that already exists.
+     * The end-device MUST reject any downlink multicast frame using this group multicast address if the frame
+     * counter is < minMcFCount.
+     */
+    uint32_t minFcFCount;
+
+    /**
+     * maxMcFCount specifies the life time of this multicast group expressed as a maximum number of frames.
+     * The end-device will only accept a multicast downlink frame if the 32bits frame counter value
+     * minMcFCount ≤ McFCount < maxMcFCount.
+     */
+    uint32_t maxFcFCount;
+
+    /**
+     * Class C session parameters
+     */
+    McClassCSessionParams_t session;
+} MulticastGroupParams_t;
 
 typedef struct {
     /**

@@ -112,6 +112,9 @@ public:
             case FRAG_SESSION_STATUS_REQ:
                 return handleFragmentationStatusReq(buffer + 1, length - 1);
 
+            case PACKAGE_VERSION_REQ:
+                return handlePackageVersionReq(buffer + 1, length - 1);
+
             default:
                return LW_UC_UNKNOWN_COMMAND;
         }
@@ -289,6 +292,21 @@ private:
         // @todo: delay not implemented
         // (As described in the “FragSessionStatusReq” command, the receivers MUST respond with a pseudo-random delay as specified by the BlockAckDelay field of the FragSessionSetupReq command.)
         send(FRAGSESSION_PORT, response, FRAG_SESSION_STATUS_ANS_LENGTH);
+
+        return LW_UC_OK;
+    }
+
+    /**
+     * Used by the AS to request the package version implemented by the end-device
+     */
+    LW_UC_STATUS handlePackageVersionReq(uint8_t *buffer, size_t length) {
+        if (length != 0) {
+            return LW_UC_INVALID_PACKET_LENGTH;
+        }
+
+        // The identifier of the fragmentation transport package is 3. The version of this package is version 1.
+        uint8_t response[PACKAGE_VERSION_ANS_LENGTH] = { PACKAGE_VERSION_ANS, 3, 1 };
+        send(FRAGSESSION_PORT, response, PACKAGE_VERSION_ANS_LENGTH);
 
         return LW_UC_OK;
     }

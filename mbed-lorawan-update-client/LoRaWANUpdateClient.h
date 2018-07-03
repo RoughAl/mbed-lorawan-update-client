@@ -29,6 +29,9 @@
 #include "update_params.h"
 #include "update_types.h"
 
+#include "mbed_trace.h"
+#define TRACE_GROUP "LWUC"
+
 #ifndef NB_FRAG_GROUPS
 #define NB_FRAG_GROUPS          1
 #endif // NB_FRAG_GROUPS
@@ -155,7 +158,7 @@ private:
         FragmentationSession *session = new FragmentationSession(&_bd, opts);
         FragResult init_res = session->initialize();
         if (init_res != FRAG_OK) {
-            printf("Failed to initialize fragmentation session (out of memory?)\n");
+            tr_error("Failed to initialize fragmentation session (out of memory?)");
             delete session;
 
             sendFragSessionAns(FSAE_NotEnoughMemory);
@@ -210,7 +213,7 @@ private:
         }
 
         if (result == FRAG_COMPLETE) {
-            printf("FragSession complete\n");
+            tr_debug("FragSession complete");
             if (_event_cb) {
                 _event_cb(LW_UC_EVENT_FRAGSESSION_COMPLETE);
             }
@@ -238,7 +241,7 @@ private:
             // So... now it depends on whether this is a delta update or not...
             uint8_t* diff_info = (uint8_t*)&(header.diff_info);
 
-            printf("Diff? %d, size=%d\n", diff_info[0], (diff_info[1] << 16) + (diff_info[2] << 8) + diff_info[3]);
+            tr_debug("Diff info: is_diff=%d, size_of_old_fw=%d", diff_info[0], (diff_info[1] << 16) + (diff_info[2] << 8) + diff_info[3]);
 
             if (diff_info[0] == 0) { // Not a diff...
                 // last FOTA_SIGNATURE_LENGTH bytes should be ignored because the signature is not part of the firmware
@@ -281,12 +284,9 @@ private:
 
                 return LW_UC_OK;
             }
-
-
-
         }
 
-        printf("process_frame failed (%d)\n", result);
+        tr_warn("process_frame failed (%d)", result);
         return LW_UC_PROCESS_FRAME_FAILED;
     }
 
@@ -321,7 +321,7 @@ private:
 
         delete sha256;
 
-        printf("SHA256 hash is: ");
+        tr_debug("New firmware SHA256 hash is: ");
         for (size_t ix = 0; ix < 32; ix++) {
             printf("%02x", sha_out_buffer[ix]);
         }
@@ -329,22 +329,22 @@ private:
 
         // now check that the signature is correct...
         {
-            printf("ECDSA signature is: ");
+            tr_debug("Expected ECDSA signature is: ");
             for (size_t ix = 0; ix < header->signature_length; ix++) {
                 printf("%02x", header->signature[ix]);
             }
             printf("\n");
-            printf("Verifying signature...\n");
+            tr_debug("Verifying signature...");
 
             // ECDSA requires a large buffer, alloc on heap instead of stack
             FragmentationEcdsaVerify* ecdsa = new FragmentationEcdsaVerify(UPDATE_CERT_PUBKEY, UPDATE_CERT_LENGTH);
             bool valid = ecdsa->verify(sha_out_buffer, header->signature, header->signature_length);
             if (!valid) {
-                printf("Signature verification failed\n");
+                tr_warn("New firmware signature verification failed");
                 return LW_UC_SIGNATURE_ECDSA_FAILED;
             }
             else {
-                printf("Signature verification passed\n");
+                tr_debug("New firmware signature verification passed");
             }
 
             delete ecdsa;
@@ -378,7 +378,7 @@ private:
 
         uint8_t *fw_header_buff = (uint8_t*)malloc(ARM_UC_EXTERNAL_HEADER_SIZE_V2);
         if (!fw_header_buff) {
-            printf("Could not allocate %d bytes for header\n", ARM_UC_EXTERNAL_HEADER_SIZE_V2);
+            tr_error("Could not allocate %d bytes for header", ARM_UC_EXTERNAL_HEADER_SIZE_V2);
             return LW_UC_OUT_OF_MEMORY;
         }
 
@@ -387,17 +387,17 @@ private:
         arm_uc_error_t err = arm_uc_create_external_header_v2(&details, &buff);
 
         if (err.error != ERR_NONE) {
-            printf("Failed to create external header (%d)\n", err.error);
+            tr_error("Failed to create external header (%d)", err.error);
             return LW_UC_CREATE_BOOTLOADER_HEADER_FAILED;
         }
 
         int r = _bd.program(buff.ptr, addr, buff.size);
         if (r != BD_ERROR_OK) {
-            printf("Failed to program firmware header: %d bytes at address 0x%x\n", buff.size, addr);
+            tr_error("Failed to program firmware header: %d bytes at address 0x%x", buff.size, addr);
             return LW_UC_BD_WRITE_ERROR;
         }
 
-        printf("Stored the update parameters in flash on 0x%x. Reset the board to apply update.\n", addr);
+        tr_debug("Stored the update parameters in flash on 0x%x. Reset the board to apply update.", addr);
 
         return LW_UC_OK;
     }
@@ -419,7 +419,7 @@ private:
 
         // so... sanity check, do we have the same size in both places
         if (sizeOfFwInSlot2 != curr_details.size) {
-            printf("Diff size mismatch, expecting %u but got %llu\n", sizeOfFwInSlot2, curr_details.size);
+            tr_warn("Diff size mismatch, expecting %u but got %llu", sizeOfFwInSlot2, curr_details.size);
             return LW_UC_DIFF_SIZE_MISMATCH;
         }
 
@@ -429,21 +429,21 @@ private:
             uint8_t sha_buffer[LW_UC_SHA256_BUFFER_SIZE];
             FragmentationSha256* sha256 = new FragmentationSha256(&_bd, sha_buffer, sizeof(sha_buffer));
 
-            printf("Firmware hash in slot 2 (current firmware): ");
-            sha256->calculate(MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT2_FW_ADDRESS, curr_details.size, sha_out_buffer);
+            tr_debug("Firmware hash in slot 2 (current firmware): ");
+            sha256->calculate(MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT2_FW_ADDRESS, sizeOfFwInSlot2, sha_out_buffer);
             print_buffer(sha_out_buffer, 32, false);
             printf("\n");
 
-            printf("Firmware hash in slot 2 (expected): ");
+            tr_debug("Firmware hash in slot 2 (expected): ");
             print_buffer(curr_details.hash, 32, false);
             printf("\n");
 
-            if (compare_buffers(curr_details.hash, sha_out_buffer, 32)) {
-                printf("Firmware in slot 2 hash incorrect hash\n");
+            if (!compare_buffers(curr_details.hash, sha_out_buffer, 32)) {
+                tr_info("Firmware in slot 2 hash incorrect hash");
                 return LW_UC_DIFF_INCORRECT_SLOT2_HASH;
             }
 
-            printf("Firmware hash in slot 0 (diff file): ");
+            tr_debug("Firmware hash in slot 0 (diff file): ");
             sha256->calculate(MBED_CONF_LORAWAN_UPDATE_CLIENT_SLOT0_FW_ADDRESS, sizeOfFwInSlot0, sha_out_buffer);
             print_buffer(sha_out_buffer, 32, false);
             printf("\n");
@@ -459,11 +459,11 @@ private:
         int v = apply_delta_update(&_bd, LW_UC_JANPATCH_BUFFER_SIZE, &source, &diff, &target);
 
         if (v != MBED_DELTA_UPDATE_OK) {
-            printf("apply_delta_update failed %d\n", v);
+            tr_warn("apply_delta_update failed %d", v);
             return LW_UC_DIFF_DELTA_UPDATE_FAILED;
         }
 
-        printf("Patched firmware length is %ld\n", target.ftell());
+        tr_debug("Patched firmware length is %ld", target.ftell());
 
         *sizeOfFwInSlot1 = target.ftell();
 
@@ -497,7 +497,7 @@ private:
         if (prefix != 0) {
             printf("%d ", prefix);
         }
-        printf("Heap stats: %d / %d (max=%d)\n", heap_stats.current_size, heap_stats.reserved_size, heap_stats.max_size);
+        tr_info("Heap stats: %d / %d (max=%d)", heap_stats.current_size, heap_stats.reserved_size, heap_stats.max_size);
     }
 
     /**

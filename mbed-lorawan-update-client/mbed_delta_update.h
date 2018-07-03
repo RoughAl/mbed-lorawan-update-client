@@ -28,6 +28,9 @@
 #include "FragmentationBlockDeviceWrapper.h"
 #include "FlashIAP.h"
 
+#include "mbed_trace.h"
+#define TRACE_GROUP "DLTA"
+
 enum MBED_DELTA_UPDATE {
     MBED_DELTA_UPDATE_OK        = 0,
     MBED_DELTA_UPDATE_NO_MEMORY = -8401
@@ -73,7 +76,7 @@ int copy_flash_to_blockdevice(const uint32_t flash_page_size, size_t flash_addre
 
         int pct = ((flash_size - bytes_left) * 100) / flash_size;
         if (pct != prv_pct) {
-            debug("Copying from flash to blockdevice: %d%%\n", ((flash_size - bytes_left) * 100) / flash_size);
+            tr_debug("Copying from flash to blockdevice: %d%%", ((flash_size - bytes_left) * 100) / flash_size);
 
             prv_pct = pct;
         }
@@ -89,7 +92,7 @@ int copy_flash_to_blockdevice(const uint32_t flash_page_size, size_t flash_addre
         return r;
     }
 
-    debug("Copying from flash to blockdevice: 100%%\n");
+    tr_debug("Copying from flash to blockdevice: 100%%");
     return MBED_DELTA_UPDATE_OK;
 }
 
@@ -117,14 +120,14 @@ int print_blockdevice_content(FragmentationBlockDeviceWrapper *bd, size_t addres
         bd->read(buffer, offset, length);
 
         for (size_t ix = 0; ix < length; ix++) {
-            debug("%02x", buffer[ix]);
+            printf("%02x", buffer[ix]);
         }
 
         offset += length;
         bytes_left -= length;
     }
 
-    debug("\n");
+    printf("\n");
 
     free(buffer);
 
@@ -135,7 +138,7 @@ static void patch_progress(uint8_t pct) {
     static uint8_t last_patch_pct = 0;
 
     if (last_patch_pct != pct) {
-        debug("Patch progress: %d%%\n", pct);
+        tr_debug("Patch progress: %d%%", pct);
         last_patch_pct = pct;
     }
 }

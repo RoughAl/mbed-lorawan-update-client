@@ -665,6 +665,16 @@ private:
 
         if (result == FRAG_COMPLETE) {
             tr_debug("FragSession complete");
+
+            // detach callbacks on the multicast group
+            mcGroup->timeoutTimeout.detach();
+            mcGroup->startTimeout.detach();
+
+            // switch back to class A
+            if (callbacks.switchToClassA) {
+                callbacks.switchToClassA();
+            }
+
             if (callbacks.fragSessionComplete) {
                 callbacks.fragSessionComplete();
             }

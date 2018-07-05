@@ -65,7 +65,8 @@ enum LW_UC_STATUS {
     LW_UC_INVALID_SLOT = 12,
     LW_UC_DIFF_SIZE_MISMATCH = 13,
     LW_UC_DIFF_INCORRECT_SLOT2_HASH = 14,
-    LW_UC_DIFF_DELTA_UPDATE_FAILED = 15
+    LW_UC_DIFF_DELTA_UPDATE_FAILED = 15,
+    LW_UC_INVALID_CLOCK_SYNC_TOKEN = 16
 };
 
 enum LW_UC_EVENT {
@@ -100,8 +101,9 @@ public:
             mc_groups[ix].active = false;
         }
 
-        clockSync.gpsTime = 0xffffffff;
-        clockSync.rtcTime = 0xffffffff;
+        _clockSync.gpsTime = 0xffffffff;
+        _clockSync.rtcTime = 0xffffffff;
+        _clockSyncTokenReq = 0;
 
         callbacks.fragSessionComplete = NULL;
         callbacks.firmwareReady = NULL;
@@ -170,6 +172,62 @@ public:
     }
 
     /**
+     * Handle packets that came in on the multicast control port (e.g. 202)
+     */
+    LW_UC_STATUS handleClockSyncCommand(uint8_t *buffer, size_t length) {
+        if (length == 0) return LW_UC_INVALID_PACKET_LENGTH;
+
+        switch (buffer[0]) {
+            case CLOCK_APP_TIME_ANS:
+                return handleClockAppTimeAns(buffer + 1, length - 1);
+
+            case CLOCK_APP_TIME_PERIODICITY_REQ:
+                return handleClockAppTimePeriodicityReq(buffer + 1, length - 1);
+
+            case CLOCK_FORCE_RESYNC_REQ:
+                return handleClockForceResyncReq(buffer + 1, length - 1);
+
+            case PACKAGE_VERSION_REQ:
+                return handleClockPackageVersionReq(buffer + 1, length - 1);
+
+            default:
+               return LW_UC_UNKNOWN_COMMAND;
+        }
+    }
+
+    /**
+     * Request in band synchronisation between RTC and GPS clock.
+     * The sync will happen in a downlink message (see handleClockAppTimeAns).
+     *
+     * @param answerRequired Whether the network should also send a message when the clock is in sync,
+     *                       if not enabled the network only replies when clock drift is >250 ms.
+     */
+    LW_UC_STATUS requestClockSync(bool answerRequired) {
+        uint32_t deviceTime = static_cast<uint32_t>(getCurrentTime_s() % 4294967296 /*pow(2, 32)*/);
+        uint8_t param = _clockSyncTokenReq % 16;
+        param += (answerRequired ? 0b10000 : 0);
+
+        uint8_t request[CLOCK_APP_TIME_REQ_LENGTH] = {
+            CLOCK_APP_TIME_REQ,
+            deviceTime & 0xff,
+            deviceTime >> 8 & 0xff,
+            deviceTime >> 16 & 0xff,
+            deviceTime >> 24 & 0xff,
+            param
+        };
+
+        // @todo, this message may not be re-transmitted... Need an API for this...
+        // This message SHALL only be transmitted a single time with a given DeviceTime payload,
+        // as the network reception time stamp will be used by the application server to compute
+        // the require clock correction. Therefore the “clock synchronization” package SHALL first
+        // temporarily disable ADR and set NbTrans=1 before transmitting this message, then revert
+        // the MAC layer to the previous state.
+        send(CLOCKSYNC_PORT, request, CLOCK_APP_TIME_REQ_LENGTH);
+
+        return LW_UC_OK;
+    }
+
+    /**
      * Out of band synchronisation between RTC and GPS clock.
      * Required for starting a Class C session.
      * RTC value is ready from the Mbed APIs, so no need to provide this (@todo: should be pluggable for external RTC).
@@ -177,8 +235,17 @@ public:
      * @param gpsTime   Current time in seconds since 00:00:00, Sunday 6th of January 1980 (start of the GPS epoch)
      */
     void outOfBandClockSync(uint32_t gpsTime) {
-        clockSync.rtcTime = get_rtc_time_s();
-        clockSync.gpsTime = gpsTime;
+        _clockSync.rtcTime = get_rtc_time_s();
+        _clockSync.gpsTime = gpsTime;
+
+        updateMcGroupsBasedOnNewTime();
+    }
+
+    /**
+     * Get the current time - in seconds since 00:00:00, Sunday 6th of January 1980 (start of the GPS epoch)
+     */
+    uint64_t getCurrentTime_s() {
+        return (get_rtc_time_s() - _clockSync.rtcTime) + _clockSync.gpsTime;
     }
 
     /**
@@ -189,6 +256,96 @@ public:
     LoRaWANUpdateClientCallbacks_t callbacks;
 
 private:
+    /**
+     * Used by the AS to request the package version implemented by the end-device
+     */
+    LW_UC_STATUS handleClockPackageVersionReq(uint8_t *buffer, size_t length) {
+        if (length != 0) {
+            return LW_UC_INVALID_PACKET_LENGTH;
+        }
+
+        // The identifier of the clock synchronization package is 1. The version of this package is version 1.
+        uint8_t response[PACKAGE_VERSION_ANS_LENGTH] = { PACKAGE_VERSION_ANS, 1, 1 };
+        send(MCCONTROL_PORT, response, PACKAGE_VERSION_ANS_LENGTH);
+
+        return LW_UC_OK;
+    }
+
+    /**
+     * The AppTimeReq message is transmitted by the end-device to request a clock correction from
+     * the application server. The message is meant to be transmitted periodically by the end-device.
+     * The default periodicity is a function of the accuracy required by the application and the maximum
+     * clock drift speed of the end-device.
+     *
+     * This is the response message from the network server.
+     */
+    LW_UC_STATUS handleClockAppTimeAns(uint8_t *buffer, size_t length) {
+        if (length != CLOCK_APP_TIME_ANS_LENGTH) {
+            return LW_UC_INVALID_PACKET_LENGTH;
+        }
+
+        int32_t timeCorrection = (buffer[3] << 24) + (buffer[2] << 16) + (buffer[1] << 8) + buffer[0];
+        uint8_t tokenAns = buffer[4] & 0b1111;
+
+        if (tokenAns != _clockSyncTokenReq % 16) {
+            tr_debug("handleClockAppTimeAns dropped due to invalid token - expected %u but was %u",
+                _clockSyncTokenReq % 16, tokenAns);
+            return LW_UC_INVALID_CLOCK_SYNC_TOKEN;
+        }
+
+        _clockSyncTokenReq++;
+
+        tr_debug("handleClockAppTimeAns, correction=%d", timeCorrection);
+
+        _clockSync.gpsTime += timeCorrection;
+
+        updateMcGroupsBasedOnNewTime();
+
+        return LW_UC_OK;
+    }
+
+    /**
+     * The DeviceAppTimePeriodicityReq command is used by the application server to modify
+     * this periodicity and/or get an instant reading of the end-device’s clock value.
+     *
+     * Not supported by the update client
+     */
+    LW_UC_STATUS handleClockAppTimePeriodicityReq(uint8_t *buffer, size_t length) {
+        if (length != CLOCK_APP_TIME_PERIODICITY_REQ_LENGTH) {
+            return LW_UC_INVALID_PACKET_LENGTH;
+        }
+
+        uint8_t response[CLOCK_APP_TIME_PERIODICITY_ANS_LENGTH] = {
+            CLOCK_APP_TIME_PERIODICITY_ANS,
+            0b1, // not supported
+            0, 0, 0, 0 //time
+        };
+
+        send(CLOCKSYNC_PORT, response, CLOCK_APP_TIME_PERIODICITY_ANS_LENGTH);
+
+        return LW_UC_OK;
+    }
+
+    /**
+     * The ForceDeviceResyncReq message is transmitted by the application server to
+     * the end-device to trigger a clock resynchronization.
+     */
+    LW_UC_STATUS handleClockForceResyncReq(uint8_t *buffer, size_t length) {
+        if (length != CLOCK_FORCE_RESYNC_REQ_LENGTH) {
+            return LW_UC_INVALID_PACKET_LENGTH;
+        }
+
+        uint8_t nbTransmissions = buffer[0] & 0b111;
+
+        if (nbTransmissions > 1) {
+            // @todo implement retries...
+            tr_debug("handleClockForceResyncReq - cannot handle nbTransmissions > 1");
+        }
+
+        requestClockSync(false);
+
+        return LW_UC_OK;
+    }
 
     /**
      * Used by the AS to request the package version implemented by the end-device
@@ -395,13 +552,10 @@ private:
             return LW_UC_OK;
         }
 
-        // No clock synchronisation done
-        if (clockSync.gpsTime == 0xffffffff || clockSync.rtcTime == 0xffffffff) {
-            tr_error("no accurate time known - abort");
-            // @todo: not handled in protocol
-            response[1] += 0b10000; // McGroupUndefined
-            send(MCCONTROL_PORT, response, 2); // omit the timeToStart (last 3 bytes)
-            return LW_UC_OK;
+        // No clock synchronisation done - this means that we need a proper clock sync before the MC request starts
+        // the response should indicate this to the network server (because timeToStart is gonna be way off)
+        if (_clockSync.gpsTime == 0xffffffff || _clockSync.rtcTime == 0xffffffff) {
+            tr_warn("no accurate time known");
         }
 
         // the start of the Class C window, and is expressed as the time in seconds since 00:00:00, Sunday 6th of January 1980 (start of the GPS epoch) modulo 2^32.
@@ -411,7 +565,7 @@ private:
         mc_groups[mcIx].params.dr = buffer[9];
 
         // ok... so now we need to know the current time based on clockSync and RTC
-        uint64_t currTime = (get_rtc_time_s() - clockSync.rtcTime) + clockSync.gpsTime;
+        uint64_t currTime = getCurrentTime_s();
 
         uint32_t timeToStart;
 
@@ -947,6 +1101,28 @@ private:
     }
 
     /**
+     * Update multicast group start dates based on an incoming clock sync
+     */
+    void updateMcGroupsBasedOnNewTime() {
+         uint64_t currTime = getCurrentTime_s();
+
+        tr_debug("updateMcGroupsBasedOnNewTime - time is now %u", currTime);
+
+        // look at all the multicast groups and see if there are active timers which are dependent on the time...
+        for (size_t mcIx = 0; mcIx < NB_MC_GROUPS; mcIx++) {
+            if (mc_groups[mcIx].active && mc_groups[mcIx].params.sessionTime > _clockSync.gpsTime) {
+                uint32_t timeToStart = mc_groups[mcIx].params.sessionTime - static_cast<uint32_t>(currTime % 4294967296 /*pow(2, 32)*/);
+
+                tr_debug("adjusted time to start for mc group %u to %u", mcIx, timeToStart);
+
+                mc_groups[mcIx].startTimeout.attach(callback(this, &LoRaWANUpdateClient::mc_start_irq), static_cast<float>(timeToStart));
+                mc_groups[mcIx].timeoutTimeout.attach(callback(this, &LoRaWANUpdateClient::mc_timeout_irq),
+                    static_cast<float>(timeToStart + mc_groups[mcIx].params.timeOut));
+            }
+        }
+    }
+
+    /**
      * Relay message back to network server - to be provided by the caller of this client
      */
     void send(uint8_t port, uint8_t *data, size_t length) {
@@ -1030,7 +1206,9 @@ private:
     // store fragmentation groups here...
     FragmentationSessionParams_t frag_sessions[NB_FRAG_GROUPS];
     MulticastGroupParams_t mc_groups[NB_MC_GROUPS];
-    ClockSync_t clockSync;
+
+    ClockSync_t _clockSync;
+    uint32_t _clockSyncTokenReq;
 
     // external storage
     FragmentationBlockDeviceWrapper _bd;

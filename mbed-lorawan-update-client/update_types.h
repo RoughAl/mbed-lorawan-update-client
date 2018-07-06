@@ -287,6 +287,89 @@ enum FragmenationSessionAnswerErrors {
     FSAE_None = -1
 };
 
+// Parameters for the send structure, this is sent to user application
+typedef struct {
+
+    /**
+     * The port to send the message on
+     */
+    uint8_t port;
+
+    /**
+     * Message buffer, note that this buffer is only valid during the initial callback.
+     * If you need the buffer afterwards, make your own copy.
+     */
+    uint8_t *data;
+
+    /**
+     * Length of the message buffer
+     */
+    size_t length;
+
+    /**
+     * Whether the message needs to be sent as a confirmed message
+     */
+    bool confirmed;
+
+    /**
+     * Whether this message may be retried, and if so, how many times.
+     * If this value is set to FALSE, the user application SHALL first temporarily disable
+     * ADR and set NbTrans=1 before transmitting this message, then revert
+     * the MAC layer to the previous state.
+     * If this value is set to TRUE, and confirmed=True, use the number of confirmed retries
+     * defined in the user application.
+     */
+    bool retriesAllowed;
+
+} LoRaWANUpdateClientSendParams_t;
+
+// Parameters for the Class C session, to be handled by the user application when the
+// multicast session starts
+typedef struct {
+
+    /**
+     * Multicast group network address.
+     */
+    uint32_t deviceAddr;
+
+    /**
+     * Network session key.
+     */
+    uint8_t nwkSKey[16];
+
+    /**
+     * Application session key.
+     */
+    uint8_t appSKey[16];
+
+    /**
+     * The minMcFCount field is the next frame counter value of the multicast downlink to be sent by the server
+     * for this group. This information is required in case an end-device is added to a group that already exists.
+     * The end-device MUST reject any downlink multicast frame using this group multicast address if the frame
+     * counter is < minMcFCount.
+     */
+    uint32_t minFcFCount;
+
+    /**
+     * maxMcFCount specifies the life time of this multicast group expressed as a maximum number of frames.
+     * The end-device will only accept a multicast downlink frame if the 32bits frame counter value
+     * minMcFCount ≤ McFCount < maxMcFCount.
+     */
+    uint32_t maxFcFCount;
+
+    /**
+     * Frequency used for the multicast in Hz.
+     */
+	uint32_t downlinkFreq;
+
+    /**
+     * Index of the data rate used for the multicast.
+     * Uses the same look-up table than the one used by the LinkAdrReq MAC command of the LoRaWAN protocol.
+     */
+    uint8_t datarate;
+
+} LoRaWANUpdateClientClassCSession_t;
+
 typedef struct {
 
     /**
@@ -303,7 +386,7 @@ typedef struct {
      * Switch to Class C callback.
      * **Note: This runs in an ISR!**
      */
-    Callback<void(uint32_t, uint8_t*, uint8_t*)> switchToClassC;
+    Callback<void(LoRaWANUpdateClientClassCSession_t&)> switchToClassC;
 
     /**
      * Switch to Class A callback

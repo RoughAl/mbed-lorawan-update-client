@@ -86,7 +86,7 @@ public:
      *                This is deliberatly not part of the callbacks structure, because it's a *required*
      *                part of the update client.
      */
-    LoRaWANUpdateClient(BlockDevice *bd, const uint8_t appKey[16], Callback<void(uint8_t, uint8_t*, size_t)> send_fn)
+    LoRaWANUpdateClient(BlockDevice *bd, const uint8_t appKey[16], Callback<void(LoRaWANUpdateClientSendParams_t&)> send_fn)
         : _bd(bd), _send_fn(send_fn)
     {
         // @todo: what if appKey is in secure element?
@@ -216,13 +216,12 @@ public:
             param
         };
 
-        // @todo, this message may not be re-transmitted... Need an API for this...
         // This message SHALL only be transmitted a single time with a given DeviceTime payload,
         // as the network reception time stamp will be used by the application server to compute
         // the require clock correction. Therefore the “clock synchronization” package SHALL first
         // temporarily disable ADR and set NbTrans=1 before transmitting this message, then revert
         // the MAC layer to the previous state.
-        send(CLOCKSYNC_PORT, request, CLOCK_APP_TIME_REQ_LENGTH);
+        send(CLOCKSYNC_PORT, request, CLOCK_APP_TIME_REQ_LENGTH, false /*confirmed*/, false /*retriesAllowed*/);
 
         return LW_UC_OK;
     }
@@ -266,7 +265,7 @@ private:
 
         // The identifier of the clock synchronization package is 1. The version of this package is version 1.
         uint8_t response[PACKAGE_VERSION_ANS_LENGTH] = { PACKAGE_VERSION_ANS, 1, 1 };
-        send(MCCONTROL_PORT, response, PACKAGE_VERSION_ANS_LENGTH);
+        send(MCCONTROL_PORT, response, PACKAGE_VERSION_ANS_LENGTH, false /*confirmed*/);
 
         return LW_UC_OK;
     }
@@ -321,7 +320,7 @@ private:
             0, 0, 0, 0 //time
         };
 
-        send(CLOCKSYNC_PORT, response, CLOCK_APP_TIME_PERIODICITY_ANS_LENGTH);
+        send(CLOCKSYNC_PORT, response, CLOCK_APP_TIME_PERIODICITY_ANS_LENGTH, true);
 
         return LW_UC_OK;
     }
@@ -357,7 +356,7 @@ private:
 
         // The identifier of the fragmentation transport package is 2. The version of this package is version 1.
         uint8_t response[PACKAGE_VERSION_ANS_LENGTH] = { PACKAGE_VERSION_ANS, 2, 1 };
-        send(MCCONTROL_PORT, response, PACKAGE_VERSION_ANS_LENGTH);
+        send(MCCONTROL_PORT, response, PACKAGE_VERSION_ANS_LENGTH, false);
 
         return LW_UC_OK;
     }
@@ -441,7 +440,7 @@ private:
         resp += error ? 0b100 : 0;
 
         uint8_t buffer[MC_GROUP_SETUP_ANS_LENGTH] = { MC_GROUP_SETUP_ANS, resp };
-        send(MCCONTROL_PORT, buffer, MC_GROUP_SETUP_ANS_LENGTH);
+        send(MCCONTROL_PORT, buffer, MC_GROUP_SETUP_ANS_LENGTH, true);
 
         return LW_UC_OK;
     }
@@ -475,7 +474,7 @@ private:
         mc_groups[mcIx].minFcFCount = 0;
         mc_groups[mcIx].maxFcFCount = 0;
 
-        send(MCCONTROL_PORT, response, MC_GROUP_DELETE_ANS_LENGTH);
+        send(MCCONTROL_PORT, response, MC_GROUP_DELETE_ANS_LENGTH, true);
 
         return LW_UC_OK;
     }
@@ -526,7 +525,7 @@ private:
         response[1] = ansGroupMask;
 
         // if we didn't use the full response, just cut it off here
-        send(MCCONTROL_PORT, response, 2 + (totalGroups * 5));
+        send(MCCONTROL_PORT, response, 2 + (totalGroups * 5), false);
 
         return LW_UC_OK;
     }
@@ -548,14 +547,8 @@ private:
         if (mcIx > NB_MC_GROUPS - 1 || mc_groups[mcIx].active == false) {
             tr_debug("mcIx out of bounds or not active");
             response[1] += 0b10000; // McGroupUndefined
-            send(MCCONTROL_PORT, response, 2); // omit the timeToStart (last 3 bytes)
+            send(MCCONTROL_PORT, response, 2, true); // omit the timeToStart (last 3 bytes)
             return LW_UC_OK;
-        }
-
-        // No clock synchronisation done - this means that we need a proper clock sync before the MC request starts
-        // the response should indicate this to the network server (because timeToStart is gonna be way off)
-        if (_clockSync.gpsTime == 0xffffffff || _clockSync.rtcTime == 0xffffffff) {
-            tr_warn("no accurate time known");
         }
 
         // the start of the Class C window, and is expressed as the time in seconds since 00:00:00, Sunday 6th of January 1980 (start of the GPS epoch) modulo 2^32.
@@ -569,7 +562,13 @@ private:
 
         uint32_t timeToStart;
 
-        if (mc_groups[mcIx].params.sessionTime < (currTime % 4294967296 /*pow(2, 32)*/)) {
+        // No clock synchronisation done - this means that we need a proper clock sync before the MC request starts
+        // the response should indicate this to the network server (because timeToStart is gonna be way off)
+        if (_clockSync.gpsTime == 0xffffffff || _clockSync.rtcTime == 0xffffffff) {
+            tr_warn("no accurate time known");
+            timeToStart = 0xffffffff;
+        }
+        else if (mc_groups[mcIx].params.sessionTime < (currTime % 4294967296 /*pow(2, 32)*/)) {
             tr_warn("ClassCSessionReq for time in the past... Starting it immediately");
             timeToStart = 0;
         }
@@ -586,11 +585,14 @@ private:
         response[3] = timeToStart >> 8 & 0xff;
         response[4] = timeToStart >> 16 & 0xff;
 
-        mc_groups[mcIx].startTimeout.attach(callback(this, &LoRaWANUpdateClient::mc_start_irq), static_cast<float>(timeToStart));
-        mc_groups[mcIx].timeoutTimeout.attach(callback(this, &LoRaWANUpdateClient::mc_timeout_irq),
-            static_cast<float>(timeToStart + mc_groups[mcIx].params.timeOut));
+        // start timers (but only if clock sync was done before, otherwise the clock sync will start them)
+        if (timeToStart != 0xffffffff) {
+            mc_groups[mcIx].startTimeout.attach(callback(this, &LoRaWANUpdateClient::mc_start_irq), static_cast<float>(timeToStart));
+            mc_groups[mcIx].timeoutTimeout.attach(callback(this, &LoRaWANUpdateClient::mc_timeout_irq),
+                static_cast<float>(timeToStart + mc_groups[mcIx].params.timeOut));
+        }
 
-        send(MCCONTROL_PORT, response, MC_CLASSC_SESSION_ANS_LENGTH);
+        send(MCCONTROL_PORT, response, MC_CLASSC_SESSION_ANS_LENGTH, true);
         return LW_UC_OK;
     }
 
@@ -684,7 +686,7 @@ private:
         uint8_t buffer[2];
         buffer[0] = FRAG_SESSION_SETUP_ANS;
         buffer[1] = response;
-        send(FRAGSESSION_PORT, buffer, 2);
+        send(FRAGSESSION_PORT, buffer, 2, true);
     }
 
     /**
@@ -709,7 +711,7 @@ private:
             response[1] += 0b100;
         }
 
-        send(FRAGSESSION_PORT, response, FRAG_SESSION_DELETE_ANS_LENGTH);
+        send(FRAGSESSION_PORT, response, FRAG_SESSION_DELETE_ANS_LENGTH, true);
 
         return LW_UC_OK;
     }
@@ -762,9 +764,9 @@ private:
             0 /* whether we're out of memory... i don't think this is possible, because we limit this at compile time */
         };
 
-        // @todo: delay not implemented
+        // @todo: delay not implemented, q: does this only apply on multicast?
         // (As described in the “FragSessionStatusReq” command, the receivers MUST respond with a pseudo-random delay as specified by the BlockAckDelay field of the FragSessionSetupReq command.)
-        send(FRAGSESSION_PORT, response, FRAG_SESSION_STATUS_ANS_LENGTH);
+        send(FRAGSESSION_PORT, response, FRAG_SESSION_STATUS_ANS_LENGTH, false);
 
         return LW_UC_OK;
     }
@@ -779,7 +781,7 @@ private:
 
         // The identifier of the fragmentation transport package is 3. The version of this package is version 1.
         uint8_t response[PACKAGE_VERSION_ANS_LENGTH] = { PACKAGE_VERSION_ANS, 3, 1 };
-        send(FRAGSESSION_PORT, response, PACKAGE_VERSION_ANS_LENGTH);
+        send(FRAGSESSION_PORT, response, PACKAGE_VERSION_ANS_LENGTH, false);
 
         return LW_UC_OK;
     }
@@ -821,8 +823,10 @@ private:
             tr_debug("FragSession complete");
 
             // detach callbacks on the multicast group
-            mcGroup->timeoutTimeout.detach();
-            mcGroup->startTimeout.detach();
+            if (mcGroup != NULL) {
+                mcGroup->timeoutTimeout.detach();
+                mcGroup->startTimeout.detach();
+            }
 
             // switch back to class A
             if (callbacks.switchToClassA) {
@@ -984,12 +988,18 @@ private:
 
         arm_uc_firmware_details_t details;
 
-        // @todo: replace by real version?
-        details.version = static_cast<uint64_t>(MBED_BUILD_TIMESTAMP) + 1; // should be timestamp that the fw was built, this is to get around this
+        // @todo: replace by real version - should be timestamp that the fw was built, and live in manifest
+        // the +10 is chosen because there are two versions at play:
+        // 1. the time the fw was actually built (in MBED_BUILD_TIMESTAMP)
+        // 2. the time the combine script was called - this is ~2 seconds later (although not guaranteed)
+        // so this is not really future proof, but good enough for testing.
+        details.version = static_cast<uint64_t>(MBED_BUILD_TIMESTAMP) + 10;
         details.size = fwSize;
         memcpy(details.hash, sha_hash, 32); // SHA256 hash of the firmware
         memset(details.campaign, 0, ARM_UC_GUID_SIZE); // todo, add campaign info
         details.signatureSize = 0; // not sure what this is used for
+
+        tr_debug("writeBootloaderHeader:\n\taddr: %u\n\tversion: %llu\n\tsize: %u", addr, details.version, details.size);
 
         uint8_t *fw_header_buff = (uint8_t*)malloc(ARM_UC_EXTERNAL_HEADER_SIZE_V2);
         if (!fw_header_buff) {
@@ -1106,7 +1116,7 @@ private:
     void updateMcGroupsBasedOnNewTime() {
          uint64_t currTime = getCurrentTime_s();
 
-        tr_debug("updateMcGroupsBasedOnNewTime - time is now %u", currTime);
+        tr_debug("updateMcGroupsBasedOnNewTime - time is now %llu", currTime);
 
         // look at all the multicast groups and see if there are active timers which are dependent on the time...
         for (size_t mcIx = 0; mcIx < NB_MC_GROUPS; mcIx++) {
@@ -1125,8 +1135,15 @@ private:
     /**
      * Relay message back to network server - to be provided by the caller of this client
      */
-    void send(uint8_t port, uint8_t *data, size_t length) {
-        _send_fn(port, data, length);
+    void send(uint8_t port, uint8_t *data, size_t length, bool confirmed = true, bool retriesAllowed = true) {
+        LoRaWANUpdateClientSendParams_t params;
+        params.port = port;
+        params.data = data;
+        params.length = length;
+        params.confirmed = confirmed;
+        params.retriesAllowed = retriesAllowed;
+
+        _send_fn(params);
     }
 
     /**
@@ -1171,7 +1188,12 @@ private:
      * Get the value of the RTC in seconds
      */
     uint32_t get_rtc_time_s() {
+#if MBED_CONF_RTOS_PRESENT
+        return static_cast<uint32_t>(Kernel::get_ms_count() / 1000);
+#else
+        // not sure if this is the right idea...
         return static_cast<uint32_t>(mbed_uptime() / 1000L / 1000L);
+#endif
     }
 
     /**
@@ -1185,7 +1207,18 @@ private:
     void mc_start_irq() {
         for (size_t ix = 0; ix < NB_MC_GROUPS; ix++) {
             if (mc_groups[ix].active && callbacks.switchToClassC) {
-                callbacks.switchToClassC(mc_groups[ix].mcAddr, mc_groups[ix].nwkSKey, mc_groups[ix].appSKey);
+
+                // copy the credentials so the user application can use them
+                LoRaWANUpdateClientClassCSession_t session;
+                session.deviceAddr = mc_groups[ix].mcAddr;
+                memcpy(session.nwkSKey, mc_groups[ix].nwkSKey, 16);
+                memcpy(session.appSKey, mc_groups[ix].appSKey, 16);
+                session.minFcFCount = mc_groups[ix].minFcFCount;
+                session.maxFcFCount = mc_groups[ix].maxFcFCount;
+                session.downlinkFreq = mc_groups[ix].params.dlFreq;
+                session.datarate = mc_groups[ix].params.dr;
+
+                callbacks.switchToClassC(session);
             }
         }
     }
@@ -1213,7 +1246,7 @@ private:
     // external storage
     FragmentationBlockDeviceWrapper _bd;
     uint8_t _appKey[16];
-    Callback<void(uint8_t, uint8_t*, size_t)> _send_fn;
+    Callback<void(LoRaWANUpdateClientSendParams_t&)> _send_fn;
 };
 
 #endif // _LORAWAN_UPDATE_CLIENT_H_
